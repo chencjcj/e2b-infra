@@ -141,7 +141,12 @@ func (a *APIStore) startSandboxInternal(
 		TemplateID: sbx.TemplateID,
 		TeamID:     team.ID.String(),
 	}
-	sbxlogger.E(logMetadata).Info(ctx, "Sandbox created", zap.String("end_time", endTime.Format("2006-01-02 15:04:05 -07:00")))
+	sbxlogger.E(logMetadata).Info(
+		ctx,
+		"Sandbox created",
+		zap.String("end_time", endTime.Format("2006-01-02 15:04:05 -07:00")),
+		zap.String("node_id", sbx.NodeID),
+	)
 
 	autoResumePolicy := "unset"
 	if sbx.AutoResume != nil {
@@ -155,6 +160,7 @@ func (a *APIStore) startSandboxInternal(
 		zap.String("auto_resume_policy", autoResumePolicy),
 		zap.Bool("auto_pause", sbx.AutoPause),
 		zap.String("template_id", sbx.BaseTemplateID),
+		zap.String("node_id", sbx.NodeID),
 	)
 
 	return sbx, nil

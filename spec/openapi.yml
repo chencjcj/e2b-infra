@@ -476,6 +476,9 @@ components:
           type: string
           nullable: true
           description: Base domain where the sandbox traffic is accessible
+        nodeID:
+          type: string
+          description: Identifier of the node where the sandbox is running
 
     SandboxDetail:
       required:
@@ -538,6 +541,9 @@ components:
           $ref: "#/components/schemas/SandboxNetworkConfig"
         lifecycle:
           $ref: "#/components/schemas/SandboxLifecycle"
+        nodeID:
+          type: string
+          description: Identifier of the node where the sandbox is running
         volumeMounts:
           type: array
           items:
@@ -589,6 +595,9 @@ components:
           $ref: "#/components/schemas/SandboxState"
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
+        nodeID:
+          type: string
+          description: Identifier of the node where the sandbox is running
         volumeMounts:
           type: array
           items:

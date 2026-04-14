@@ -124,6 +124,7 @@ func (a *APIStore) GetSandboxesSandboxID(c *gin.Context, id string) {
 			Domain:              sbxDomain,
 			Network:             dbNetworkConfigToAPI(sbx.Network),
 			Lifecycle:           sandboxLifecycleToAPI(sbx.AutoPause, sbx.AutoResume),
+			NodeID:              stringPtrIfNotEmpty(sbx.NodeID),
 			VolumeMounts:        convertFromDBMountsToAPIMounts(sbx.VolumeMounts),
 		}
 
@@ -228,4 +229,11 @@ func (a *APIStore) GetSandboxesSandboxID(c *gin.Context, id string) {
 	}
 
 	c.JSON(http.StatusOK, sandbox)
+}
+
+func stringPtrIfNotEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

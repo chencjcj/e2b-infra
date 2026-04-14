@@ -118,6 +118,7 @@ func (s Sandbox) ToAPISandbox() *api.Sandbox {
 		EnvdAccessToken:    s.EnvdAccessToken,
 		TrafficAccessToken: s.TrafficAccessToken,
 		Domain:             s.Domain,
+		NodeID:             stringPtrIfNotEmpty(s.NodeID),
 	}
 }
 
@@ -127,6 +128,13 @@ func (s Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
 		TemplateID: s.TemplateID,
 		TeamID:     s.TeamID.String(),
 	}
+}
+
+func stringPtrIfNotEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func (s Sandbox) IsExpired(now time.Time) bool {

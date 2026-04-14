@@ -327,6 +327,7 @@ func instanceInfoToPaginatedSandboxes(runningSandboxes []sandbox.Sandbox) []util
 				EndAt:        info.EndTime,
 				State:        state,
 				EnvdVersion:  info.EnvdVersion,
+				NodeID:       stringPtrIfNotEmpty(info.NodeID),
 				VolumeMounts: convertFromDBMountsToAPIMounts(info.VolumeMounts),
 			},
 			PaginationTimestamp: info.StartTime,
