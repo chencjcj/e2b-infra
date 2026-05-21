@@ -217,6 +217,14 @@ func (u *Uffd) Exit() *utils.ErrorOnce {
 	return u.exit
 }
 
+func (u *Uffd) LastFatalReason() string {
+	handler, err := u.handler.Result()
+	if err != nil || handler == nil {
+		return ""
+	}
+	return handler.LastFatalReason()
+}
+
 // DiffMetadata waits for the current requests to finish and returns the dirty pages.
 //
 // It *MUST* be only called after the sandbox was successfully paused via API and after the snapshot endpoint was called.

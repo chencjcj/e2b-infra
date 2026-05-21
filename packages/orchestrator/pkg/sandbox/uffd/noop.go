@@ -81,3 +81,7 @@ func (m *NoopMemory) Ready() chan struct{} {
 func (m *NoopMemory) Exit() *utils.ErrorOnce {
 	return m.exit
 }
+
+func (m *NoopMemory) LastFatalReason() string {
+	return ""
+}

@@ -95,6 +95,47 @@ func TestBestOfK_Score_WithPendingResources(t *testing.T) {
 	assert.Greater(t, scorePending, scoreNormal, "Node with pending resources should receive a higher (worse) score")
 }
 
+func TestBestOfK_CanFitHugepages(t *testing.T) {
+	t.Parallel()
+	config := DefaultBestOfKConfig() // watermark 0.80
+	algo := NewBestOfK(config).(*BestOfK)
+
+	cases := []struct {
+		name       string
+		totalBytes uint64
+		freeBytes  uint64
+		want       bool
+	}{
+		{"no pool configured", 0, 0, true},                     // skip gate
+		{"empty pool", 1000, 1000, true},                       // 0% used
+		{"below watermark", 1000, 250, true},                   // 75% used
+		{"just below watermark", 1000, 201, true},              // 79.9% used
+		{"at watermark", 1000, 200, false},                     // 80% used — reject
+		{"above watermark", 1000, 100, false},                  // 90% used — reject
+		{"fully used", 1000, 0, false},                         // 100% used
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := nodemanager.NewTestNode("test-node", api.NodeStatusReady, 0, 4,
+				nodemanager.WithHugepages(tc.totalBytes, tc.freeBytes))
+			got := algo.CanFitHugepages(node, config)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestBestOfK_CanFitHugepages_DisabledByConfig(t *testing.T) {
+	t.Parallel()
+	config := DefaultBestOfKConfig()
+	config.HugepagesSoftWatermark = 0 // disables the gate
+	algo := NewBestOfK(config).(*BestOfK)
+
+	// Even at 100% used, a disabled gate returns true.
+	node := nodemanager.NewTestNode("test-node", api.NodeStatusReady, 0, 4,
+		nodemanager.WithHugepages(1000, 0))
+	assert.True(t, algo.CanFitHugepages(node, config))
+}
+
 func TestBestOfK_CanFit(t *testing.T) {
 	t.Parallel()
 	config := DefaultBestOfKConfig()

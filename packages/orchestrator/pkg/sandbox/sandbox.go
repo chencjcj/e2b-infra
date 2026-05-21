@@ -246,6 +246,24 @@ func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
 	}
 }
 
+func (s *Sandbox) Pid() (int, error) {
+	if s.process == nil {
+		return 0, errors.New("fc process not initialized")
+	}
+	return s.process.Pid()
+}
+
+func (s *Sandbox) MemoryCurrent() (uint64, error) {
+	return s.cgroupHandle.MemoryCurrent()
+}
+
+func (s *Sandbox) LastFatalReason() string {
+	if s.Resources == nil || s.Resources.memory == nil {
+		return ""
+	}
+	return s.Resources.memory.LastFatalReason()
+}
+
 // GetStartedAt returns the sandbox start time in a thread-safe manner.
 func (m *Metadata) GetStartedAt() time.Time {
 	m.rwmu.RLock()

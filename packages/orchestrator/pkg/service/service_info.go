@@ -52,6 +52,12 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		diskMetrics = []metrics.DiskInfo{}
 	}
 
+	hugepageMetrics, err := s.hostMetrics.GetHugepageMetrics()
+	if err != nil {
+		logger.L().Warn(ctx, "Failed to get hugepage metrics", zap.Error(err))
+		hugepageMetrics = &metrics.HugepageMetrics{}
+	}
+
 	// Calculate sandbox resource allocation
 	sandboxVCpuAllocated := uint32(0)
 	sandboxMemoryAllocated := uint64(0)
@@ -89,6 +95,9 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		// Host system total resources
 		MetricCpuCount:         cpuMetrics.Count,
 		MetricMemoryTotalBytes: memoryMetrics.TotalBytes,
+
+		MetricHugepagesTotalBytes: hugepageMetrics.TotalBytes,
+		MetricHugepagesFreeBytes:  hugepageMetrics.FreeBytes,
 
 		// Detailed disk metrics
 		MetricDisks: convertDiskMetrics(diskMetrics),

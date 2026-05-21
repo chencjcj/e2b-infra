@@ -69,6 +69,9 @@ message ServiceInfoResponse {
 
   // Detailed disk metrics for each mount point
   repeated DiskMetrics metric_disks = 113;
+
+  uint64 metric_hugepages_total_bytes = 114;
+  uint64 metric_hugepages_free_bytes  = 115;
 }
 
 message ServiceStatusChangeRequest {

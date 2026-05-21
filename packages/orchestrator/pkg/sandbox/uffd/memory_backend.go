@@ -17,4 +17,6 @@ type MemoryBackend interface {
 	Stop() error
 	Ready() chan struct{}
 	Exit() *utils.ErrorOnce
+	// LastFatalReason returns a tag for classified failures (e.g. "hugepage_oom"), or "".
+	LastFatalReason() string
 }

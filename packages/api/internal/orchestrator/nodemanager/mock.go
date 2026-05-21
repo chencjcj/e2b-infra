@@ -100,6 +100,13 @@ func WithLabels(labels []string) TestOptions {
 	}
 }
 
+func WithHugepages(totalBytes, freeBytes uint64) TestOptions {
+	return func(node *TestNode) {
+		node.metrics.HugepagesTotalBytes = totalBytes
+		node.metrics.HugepagesFreeBytes = freeBytes
+	}
+}
+
 // mockSandboxClientWithError implements orchestrator.SandboxServiceClient that returns an error
 type mockSandboxClientWithError struct {
 	orchestrator.SandboxServiceClient

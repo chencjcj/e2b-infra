@@ -15,6 +15,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -25,9 +26,31 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/memory"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/pagepool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd")
+
+const (
+	// Stall budget stays under guest soft-lockup (~22s) and RCU-stall (~21s) thresholds.
+	uffdEnomemStallBudget  = 5 * time.Second
+	uffdEnomemBaseBackoff  = 50 * time.Millisecond
+	uffdEnomemMaxBackoff   = 500 * time.Millisecond
+	uffdFatalReasonHugeOOM = "hugepage_oom"
+)
+
+var (
+	uffdMeter = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd")
+
+	uffdOutcomeKey     = attribute.Key("outcome")
+	attrRetrySucceeded = metric.WithAttributes(uffdOutcomeKey.String("retry_succeeded"))
+	attrRetryExhausted = metric.WithAttributes(uffdOutcomeKey.String("retry_exhausted"))
+
+	uffdCopyEnomemTotal = utils.Must(telemetry.GetCounter(uffdMeter, telemetry.SandboxUffdCopyEnomemTotal))
+	uffdStallDuration   = utils.Must(telemetry.GetHistogram(uffdMeter, telemetry.SandboxUffdStallDuration))
+	hugepageOomTotal    = utils.Must(telemetry.GetCounter(uffdMeter, telemetry.NodeHugepageOomTotal))
+)
 
 const maxRequestsInProgress = 4096
 
@@ -76,6 +99,9 @@ type Userfaultfd struct {
 
 	// Enabled by UFFD_FAULT_TRACE_DIR.
 	faultTrace *faultTracer
+
+	// Set on UFFDIO_COPY ENOMEM exhaustion; tags the exit lifecycle event.
+	lastFatalReason atomic.Pointer[string]
 
 	logger logger.Logger
 }
@@ -176,6 +202,13 @@ func (u *Userfaultfd) Close() error {
 		}
 	}
 	return u.fd.close()
+}
+
+func (u *Userfaultfd) LastFatalReason() string {
+	if r := u.lastFatalReason.Load(); r != nil {
+		return *r
+	}
+	return ""
 }
 
 func (u *Userfaultfd) Serve(
@@ -523,6 +556,10 @@ retryLoop:
 
 	copyErr := u.fd.copy(addr, u.pageSize, b, copyMode)
 
+	if errors.Is(copyErr, unix.ENOMEM) {
+		copyErr = u.stallOnEnomem(ctx, addr, b, copyMode)
+	}
+
 	if errors.Is(copyErr, unix.EEXIST) {
 		// Page is already mapped
 		span.SetAttributes(attribute.Bool("uffd.already_mapped", true))
@@ -541,6 +578,12 @@ retryLoop:
 	}
 
 	if copyErr != nil {
+		if errors.Is(copyErr, unix.ENOMEM) {
+			reason := uffdFatalReasonHugeOOM
+			u.lastFatalReason.CompareAndSwap(nil, &reason)
+			hugepageOomTotal.Add(ctx, 1)
+		}
+
 		signalErr := safeInvoke(onFailure)
 
 		joinedErr := errors.Join(copyErr, signalErr)
@@ -555,6 +598,56 @@ retryLoop:
 	u.prefetchTracker.Add(offset, accessType)
 
 	return nil
+}
+
+// stallOnEnomem retries UFFDIO_COPY until pages free up or the budget elapses.
+func (u *Userfaultfd) stallOnEnomem(ctx context.Context, addr uintptr, b []byte, copyMode CULong) error {
+	stallStart := time.Now()
+	backoff := uffdEnomemBaseBackoff
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+
+	var copyErr error = unix.ENOMEM
+	for {
+		if time.Since(stallStart) >= uffdEnomemStallBudget {
+			uffdCopyEnomemTotal.Add(ctx, 1, attrRetryExhausted)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetryExhausted)
+			u.logger.Warn(ctx, "UFFD stall budget exhausted, sandbox will be killed",
+				zap.Duration("budget", uffdEnomemStallBudget),
+			)
+			return copyErr
+		}
+
+		timer.Reset(backoff)
+		select {
+		case <-ctx.Done():
+			uffdCopyEnomemTotal.Add(ctx, 1, attrRetryExhausted)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetryExhausted)
+			return copyErr
+		case <-timer.C:
+		}
+
+		copyErr = u.fd.copy(addr, u.pageSize, b, copyMode)
+		if copyErr == nil ||
+			errors.Is(copyErr, unix.EEXIST) ||
+			errors.Is(copyErr, unix.ESRCH) {
+			uffdCopyEnomemTotal.Add(ctx, 1, attrRetrySucceeded)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetrySucceeded)
+			return copyErr
+		}
+		if !errors.Is(copyErr, unix.ENOMEM) {
+			uffdCopyEnomemTotal.Add(ctx, 1, attrRetryExhausted)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetryExhausted)
+			return copyErr
+		}
+
+		if backoff < uffdEnomemMaxBackoff {
+			backoff *= 2
+			if backoff > uffdEnomemMaxBackoff {
+				backoff = uffdEnomemMaxBackoff
+			}
+		}
+	}
 }
 
 func (u *Userfaultfd) faultPageContinue(

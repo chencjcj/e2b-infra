@@ -162,7 +162,7 @@ func (o *Orchestrator) getOrConnectNode(ctx context.Context, clusterID uuid.UUID
 			return nil, nil
 		}
 
-		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheSyncTime)
+		connectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheSyncTime())
 		defer cancel()
 
 		if clusterID == consts.LocalClusterID {

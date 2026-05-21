@@ -428,15 +428,23 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 		return nil, status.Errorf(codes.NotFound, "sandbox '%s' not found", in.GetSandboxId())
 	}
 
-	// Mark the sandbox as stopping so it is excluded from live queries (Get, Items,
-	// Count) but remains findable by IP (GetByHostPort) while the Firecracker
-	// process finishes shutting down.
-	// This prevents the sandbox from being synced to API again.
+	if err := s.StopRunningSandbox(ctx, sbx, nil); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// StopRunningSandbox kills a sandbox without snapshotting. Used by the Delete
+// handler and the pressure monitor (eviction must not snapshot — would need pages).
+func (s *Server) StopRunningSandbox(
+	ctx context.Context,
+	sbx *sandbox.Sandbox,
+	extraEventData map[string]any,
+) error {
 	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
 	if !marked {
-		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", nil, telemetry.WithSandboxID(in.GetSandboxId()))
-
-		return nil, status.Errorf(codes.Internal, "failed to delete sandbox '%s'", in.GetSandboxId())
+		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", nil, telemetry.WithSandboxID(sbx.Runtime.SandboxID))
+		return status.Errorf(codes.Internal, "failed to delete sandbox '%s'", sbx.Runtime.SandboxID)
 	}
 
 	sbxlogger.E(sbx).Info(ctx, "Killing sandbox")
@@ -444,18 +452,20 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	// Check health metrics before stopping the sandbox
 	sbx.Checks.Healthcheck(ctx, true)
 
-	// Start the cleanup in a goroutine—the initial kill request should be send as the first thing in stop, and at this point you cannot route to the sandbox anymore.
-	// We don't wait for the whole cleanup to finish here.
+	// Cleanup runs in background; the initial kill request is the first thing in Stop.
 	go func() {
 		err := sbx.Stop(context.WithoutCancel(ctx))
 		if err != nil {
-			sbxlogger.I(sbx).Error(ctx, "error stopping sandbox", logger.WithSandboxID(in.GetSandboxId()), zap.Error(err))
+			sbxlogger.I(sbx).Error(ctx, "error stopping sandbox", logger.WithSandboxID(sbx.Runtime.SandboxID), zap.Error(err))
 		}
 	}()
 
 	teamID, buildId, eventData := s.prepareSandboxEventData(ctx, sbx)
 	if s.featureFlags.BoolFlag(ctx, featureflags.ExecutionMetricsOnWebhooksFlag) {
 		eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	}
+	for k, v := range extraEventData {
+		eventData[k] = v
 	}
 
 	eventType := events.SandboxKilledEventPair
@@ -477,7 +487,7 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 		},
 	)
 
-	return &emptypb.Empty{}, nil
+	return nil
 }
 
 func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest) (*emptypb.Empty, error) {
@@ -499,11 +509,23 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		return nil, status.Error(codes.NotFound, "sandbox not found")
 	}
 
+	if err := s.PauseRunningSandbox(ctx, sbx, in.GetBuildId(), nil); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// PauseRunningSandbox snapshots and stops sbx. Returns a gRPC status error.
+func (s *Server) PauseRunningSandbox(
+	ctx context.Context,
+	sbx *sandbox.Sandbox,
+	buildID string,
+	extraEventData map[string]any,
+) error {
 	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
 	if !marked {
-		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", nil, telemetry.WithSandboxID(in.GetSandboxId()))
-
-		return nil, status.Error(codes.Internal, "failed to pause sandbox")
+		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", nil, telemetry.WithSandboxID(sbx.Runtime.SandboxID))
+		return status.Error(codes.Internal, "failed to pause sandbox")
 	}
 
 	sbxlogger.E(sbx).Info(ctx, "Pausing sandbox")
@@ -512,11 +534,10 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	defer s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)
 
 	// Fire and forget - upload completes in the background
-	res, err := s.snapshotAndCacheSandbox(ctx, sbx, in.GetBuildId())
+	res, err := s.snapshotAndCacheSandbox(ctx, sbx, buildID)
 	if err != nil {
-		telemetry.ReportCriticalError(ctx, "error snapshotting sandbox", err, telemetry.WithSandboxID(in.GetSandboxId()))
-
-		return nil, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
+		telemetry.ReportCriticalError(ctx, "error snapshotting sandbox", err, telemetry.WithSandboxID(sbx.Runtime.SandboxID))
+		return status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", sbx.Runtime.SandboxID, err)
 	}
 
 	s.uploadSnapshotAsync(ctx, sbx, res)
@@ -524,6 +545,9 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	teamID, buildId, eventData := s.prepareSandboxEventData(ctx, sbx)
 	if s.featureFlags.BoolFlag(ctx, featureflags.ExecutionMetricsOnWebhooksFlag) {
 		eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	}
+	for k, v := range extraEventData {
+		eventData[k] = v
 	}
 
 	eventType := events.SandboxPausedEventPair
@@ -545,7 +569,7 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		},
 	)
 
-	return &emptypb.Empty{}, nil
+	return nil
 }
 
 func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
@@ -830,6 +854,13 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 			sbxlogger.I(sbx).Error(ctx, "failed to wait for sandbox, cleaning up", zap.Error(waitErr))
 		}
 
+		if reason := sbx.LastFatalReason(); reason != "" {
+			marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
+			if marked {
+				s.publishUnexpectedKillEvent(ctx, sbx, reason)
+			}
+		}
+
 		cleanupErr := sbx.Close(ctx)
 		if cleanupErr != nil {
 			sbxlogger.I(sbx).Error(ctx, "failed to cleanup sandbox, will remove from cache", zap.Error(cleanupErr))
@@ -842,6 +873,32 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 
 		sbxlogger.E(sbx).Info(ctx, "Sandbox stopped")
 	}()
+}
+
+func (s *Server) publishUnexpectedKillEvent(ctx context.Context, sbx *sandbox.Sandbox, reason string) {
+	teamID, buildId, eventData := s.prepareSandboxEventData(ctx, sbx)
+	if s.featureFlags.BoolFlag(ctx, featureflags.ExecutionMetricsOnWebhooksFlag) {
+		eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	}
+	eventData["reason"] = reason
+
+	go s.sbxEventsService.Publish(
+		context.WithoutCancel(ctx),
+		teamID,
+		events.SandboxEvent{
+			Version:   events.StructureVersionV2,
+			ID:        uuid.New(),
+			Type:      events.SandboxKilledEventPair.Type,
+			Timestamp: time.Now().UTC(),
+
+			EventData:          eventData,
+			SandboxID:          sbx.Runtime.SandboxID,
+			SandboxExecutionID: sbx.Runtime.ExecutionID,
+			SandboxTemplateID:  sbx.Config.BaseTemplateID,
+			SandboxBuildID:     buildId,
+			SandboxTeamID:      teamID,
+		},
+	)
 }
 
 // stopSandboxAsync stops the sandbox in a background goroutine.

@@ -51,6 +51,10 @@ const (
 
 const (
 	SandboxCpuUsedGaugeName GaugeFloatType = "e2b.sandbox.cpu.used"
+
+	// PSI from /proc/pressure/memory.
+	NodeMemoryPressureSomeAvg10GaugeName GaugeFloatType = "e2b.node.memory.pressure.some.avg10"
+	NodeMemoryPressureFullAvg10GaugeName GaugeFloatType = "e2b.node.memory.pressure.full.avg10"
 )
 
 const (
@@ -98,6 +102,10 @@ const (
 	// Carry a direction=read/write attribute where applicable.
 	SandboxFCBlockFails         CounterType = "orchestrator.sandbox.fc.block.fails"
 	SandboxFCBlockNoAvailBuffer CounterType = "orchestrator.sandbox.fc.block.no_avail_buffer"
+
+	// outcome=retry_succeeded|retry_exhausted.
+	SandboxUffdCopyEnomemTotal CounterType = "orchestrator.sandbox.uffd.copy_enomem.total"
+	NodeHugepageOomTotal       CounterType = "e2b.node.hugepage_oom.total"
 )
 
 const (
@@ -111,6 +119,8 @@ const (
 	// TX-only: no RX equivalent in Firecracker metrics.
 	SandboxFCNetRateLimiterEventCount HistogramType = "orchestrator.sandbox.fc.net.rate_limiter_event_count"
 	SandboxFCNetRemainingReqs         HistogramType = "orchestrator.sandbox.fc.net.remaining_reqs"
+
+	SandboxUffdStallDuration HistogramType = "orchestrator.sandbox.uffd.stall_duration"
 
 	// Firecracker block histograms — per-sandbox distribution per metrics flush, no sandbox_id.
 	// Symmetric read/write metrics carry a direction=read/write attribute.
@@ -132,6 +142,16 @@ const (
 	SandboxCpuTotalGaugeName  GaugeIntType = "e2b.sandbox.cpu.total"
 	SandboxDiskUsedGaugeName  GaugeIntType = "e2b.sandbox.disk.used"
 	SandboxDiskTotalGaugeName GaugeIntType = "e2b.sandbox.disk.total"
+
+	// Sandbox host-side metrics (sourced from /proc and cgroup, not envd).
+	SandboxHugepagesUsedGaugeName GaugeIntType = "e2b.sandbox.hugepages.used_bytes"
+	SandboxMemoryCurrentGaugeName GaugeIntType = "e2b.sandbox.memory.current_bytes"
+
+	// Node hugepage pool from /proc/meminfo.
+	NodeHugepagesTotalBytesGaugeName    GaugeIntType = "e2b.node.hugepages.total_bytes"
+	NodeHugepagesFreeBytesGaugeName     GaugeIntType = "e2b.node.hugepages.free_bytes"
+	NodeHugepagesReservedBytesGaugeName GaugeIntType = "e2b.node.hugepages.reserved_bytes"
+	NodeHugepagesSurplusBytesGaugeName  GaugeIntType = "e2b.node.hugepages.surplus_bytes"
 
 	// Team metrics
 	TeamSandboxRunningGaugeName GaugeIntType = "e2b.team.sandbox.running"
@@ -162,6 +182,9 @@ var counterDesc = map[CounterType]string{
 
 	SandboxFCBlockFails:         "Total Firecracker VMM block device execution/event failures",
 	SandboxFCBlockNoAvailBuffer: "Total Firecracker VMM block events where no virtqueue buffer was available",
+
+	SandboxUffdCopyEnomemTotal: "UFFDIO_COPY calls that hit ENOMEM (hugepage pool exhausted), bucketed by outcome of the stall retry loop.",
+	NodeHugepageOomTotal:       "Sandboxes terminated because UFFDIO_COPY could not be served within the stall budget after exhausting retries.",
 }
 
 var counterUnits = map[CounterType]string{
@@ -184,6 +207,9 @@ var counterUnits = map[CounterType]string{
 
 	SandboxFCBlockFails:         "{error}",
 	SandboxFCBlockNoAvailBuffer: "{event}",
+
+	SandboxUffdCopyEnomemTotal: "{event}",
+	NodeHugepageOomTotal:       "{sandbox}",
 }
 
 var observableCounterDesc = map[ObservableCounterType]string{
@@ -227,35 +253,51 @@ var observableUpDownCounterUnits = map[ObservableUpDownCounterType]string{
 }
 
 var gaugeFloatDesc = map[GaugeFloatType]string{
-	SandboxCpuUsedGaugeName: "Amount of CPU used by the sandbox.",
+	SandboxCpuUsedGaugeName:              "Amount of CPU used by the sandbox.",
+	NodeMemoryPressureSomeAvg10GaugeName: "Node-wide PSI memory pressure (some) averaged over 10 seconds.",
+	NodeMemoryPressureFullAvg10GaugeName: "Node-wide PSI memory pressure (full) averaged over 10 seconds.",
 }
 
 var gaugeFloatUnits = map[GaugeFloatType]string{
-	SandboxCpuUsedGaugeName: "{percent}",
+	SandboxCpuUsedGaugeName:              "{percent}",
+	NodeMemoryPressureSomeAvg10GaugeName: "{percent}",
+	NodeMemoryPressureFullAvg10GaugeName: "{percent}",
 }
 
 var gaugeIntDesc = map[GaugeIntType]string{
-	ApiOrchestratorCountMeterName: "Counter of running orchestrators.",
-	SandboxRamUsedGaugeName:       "Amount of RAM used by the sandbox.",
-	SandboxRamTotalGaugeName:      "Amount of RAM available to the sandbox.",
-	SandboxRamCacheGaugeName:      "Amount of RAM used by the page cache in the sandbox.",
-	SandboxCpuTotalGaugeName:      "Amount of CPU available to the sandbox.",
-	SandboxDiskUsedGaugeName:      "Amount of disk space used by the sandbox.",
-	SandboxDiskTotalGaugeName:     "Amount of disk space available to the sandbox.",
-	TeamSandboxRunningGaugeName:   "The number of sandboxes running for the team in the interval.",
-	SandboxCountGaugeName:         "Number of running sandbox instances per team.",
+	ApiOrchestratorCountMeterName:       "Counter of running orchestrators.",
+	SandboxRamUsedGaugeName:             "Amount of RAM used by the sandbox.",
+	SandboxRamTotalGaugeName:            "Amount of RAM available to the sandbox.",
+	SandboxRamCacheGaugeName:            "Amount of RAM used by the page cache in the sandbox.",
+	SandboxCpuTotalGaugeName:            "Amount of CPU available to the sandbox.",
+	SandboxDiskUsedGaugeName:            "Amount of disk space used by the sandbox.",
+	SandboxDiskTotalGaugeName:           "Amount of disk space available to the sandbox.",
+	SandboxHugepagesUsedGaugeName:       "Hugepage bytes mapped into the sandbox's Firecracker process (Private_Hugetlb + Shared_Hugetlb from smaps_rollup).",
+	SandboxMemoryCurrentGaugeName:       "Current memory usage of the sandbox cgroup (memory.current).",
+	NodeHugepagesTotalBytesGaugeName:    "Total hugepage pool size on the node.",
+	NodeHugepagesFreeBytesGaugeName:     "Free hugepage pool size on the node.",
+	NodeHugepagesReservedBytesGaugeName: "Hugepages reserved but not yet allocated on the node.",
+	NodeHugepagesSurplusBytesGaugeName:  "Surplus hugepages dynamically allocated above the configured pool.",
+	TeamSandboxRunningGaugeName:         "The number of sandboxes running for the team in the interval.",
+	SandboxCountGaugeName:               "Number of running sandbox instances per team.",
 }
 
 var gaugeIntUnits = map[GaugeIntType]string{
-	ApiOrchestratorCountMeterName: "{orchestrator}",
-	SandboxRamUsedGaugeName:       "{By}",
-	SandboxRamTotalGaugeName:      "{By}",
-	SandboxRamCacheGaugeName:      "{By}",
-	SandboxCpuTotalGaugeName:      "{count}",
-	SandboxDiskUsedGaugeName:      "{By}",
-	SandboxDiskTotalGaugeName:     "{By}",
-	TeamSandboxRunningGaugeName:   "{sandbox}",
-	SandboxCountGaugeName:         "{sandbox}",
+	ApiOrchestratorCountMeterName:       "{orchestrator}",
+	SandboxRamUsedGaugeName:             "{By}",
+	SandboxRamTotalGaugeName:            "{By}",
+	SandboxRamCacheGaugeName:            "{By}",
+	SandboxCpuTotalGaugeName:            "{count}",
+	SandboxDiskUsedGaugeName:            "{By}",
+	SandboxDiskTotalGaugeName:           "{By}",
+	SandboxHugepagesUsedGaugeName:       "{By}",
+	SandboxMemoryCurrentGaugeName:       "{By}",
+	NodeHugepagesTotalBytesGaugeName:    "{By}",
+	NodeHugepagesFreeBytesGaugeName:     "{By}",
+	NodeHugepagesReservedBytesGaugeName: "{By}",
+	NodeHugepagesSurplusBytesGaugeName:  "{By}",
+	TeamSandboxRunningGaugeName:         "{sandbox}",
+	SandboxCountGaugeName:               "{sandbox}",
 }
 
 func GetCounter(meter metric.Meter, name CounterType) (metric.Int64Counter, error) {
@@ -342,6 +384,8 @@ var histogramDesc = map[HistogramType]string{
 	SandboxFCNetRateLimiterEventCount: "Distribution of Firecracker VMM TX rate limiter events per metrics flush",
 	SandboxFCNetRemainingReqs:         "Distribution of Firecracker VMM TX queue remaining-request events per metrics flush",
 
+	SandboxUffdStallDuration: "Duration spent waiting for UFFDIO_COPY to succeed after hitting ENOMEM (with outcome=retry_succeeded|retry_exhausted attribute).",
+
 	// Firecracker block histograms (direction=read/write attribute)
 	SandboxFCBlockBytes:                 "Distribution of Firecracker VMM block bytes per metrics flush",
 	SandboxFCBlockCount:                 "Distribution of Firecracker VMM block I/O operations per metrics flush",
@@ -371,6 +415,8 @@ var histogramUnits = map[HistogramType]string{
 	SandboxFCNetRateLimiterThrottled:  "{op}",
 	SandboxFCNetRateLimiterEventCount: "{event}",
 	SandboxFCNetRemainingReqs:         "{event}",
+
+	SandboxUffdStallDuration: "ms",
 
 	// Firecracker block histograms
 	SandboxFCBlockBytes:                 "{By}",

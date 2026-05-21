@@ -13,14 +13,20 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/orchestrator")
 
-// cacheSyncTime is the time to sync the cache with the actual instances in Orchestrator.
-const cacheSyncTime = 20 * time.Second
+func cacheSyncTime() time.Duration {
+	ms, _ := env.GetEnvAsInt("API_CACHE_SYNC_INTERVAL_MS", 5000)
+	if ms <= 0 {
+		ms = 5000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 const nodeConnectTimeout = 5 * time.Second
 
@@ -35,7 +41,7 @@ func (o *Orchestrator) keepInSync(ctx context.Context, store *sandbox.Store, ski
 	o.syncNodes(ctx, store, skipSyncingWithNomad)
 
 	// Sync the nodes every cacheSyncTime
-	ticker := time.NewTicker(cacheSyncTime)
+	ticker := time.NewTicker(cacheSyncTime())
 	defer ticker.Stop()
 
 	for {
@@ -51,7 +57,11 @@ func (o *Orchestrator) keepInSync(ctx context.Context, store *sandbox.Store, ski
 }
 
 func (o *Orchestrator) syncNodes(ctx context.Context, store *sandbox.Store, skipSyncingWithNomad bool) {
-	ctxTimeout, cancel := context.WithTimeout(ctx, cacheSyncTime)
+	syncTimeout := cacheSyncTime()
+	if syncTimeout < 10*time.Second {
+		syncTimeout = 10 * time.Second
+	}
+	ctxTimeout, cancel := context.WithTimeout(ctx, syncTimeout)
 	defer cancel()
 
 	ctx, span := tracer.Start(ctxTimeout, "keep-in-sync")

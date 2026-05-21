@@ -288,6 +288,53 @@ func TestCgroupHandleRemoveNonExistent(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestSetHugetlbMax_NilHandle(t *testing.T) {
+	t.Parallel()
+	var h *CgroupHandle
+	require.NoError(t, h.SetHugetlbMax(123))
+}
+
+func TestSetHugetlbMax_NoopHandle(t *testing.T) {
+	t.Parallel()
+	h := &CgroupHandle{noop: true}
+	require.NoError(t, h.SetHugetlbMax(123))
+}
+
+func TestSetHugetlbMax_WritesValue(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	cgroupPath := filepath.Join(tmpDir, "sbx-test")
+	require.NoError(t, os.MkdirAll(cgroupPath, 0o755))
+	// Pre-create hugetlb.2MB.max — the kernel would normally own it.
+	hugetlbPath := filepath.Join(cgroupPath, "hugetlb.2MB.max")
+	require.NoError(t, os.WriteFile(hugetlbPath, []byte("max"), 0o644))
+
+	h := &CgroupHandle{
+		cgroupName: "sbx-test",
+		path:       cgroupPath,
+	}
+
+	const limit uint64 = 200 * 1024 * 1024
+	require.NoError(t, h.SetHugetlbMax(limit))
+
+	data, err := os.ReadFile(hugetlbPath)
+	require.NoError(t, err)
+	assert.Equal(t, "209715200", string(data))
+}
+
+func TestSetHugetlbMax_PathMissing(t *testing.T) {
+	t.Parallel()
+
+	// Path doesn't exist — simulates the cgroup being removed underneath us.
+	h := &CgroupHandle{
+		cgroupName: "sbx-test",
+		path:       filepath.Join(t.TempDir(), "does-not-exist"),
+	}
+	err := h.SetHugetlbMax(1024)
+	require.Error(t, err)
+}
+
 func TestStatsParsing(t *testing.T) {
 	t.Parallel()
 
