@@ -18,6 +18,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/fdexit"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/memory"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/pagepool"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -41,11 +42,12 @@ type Uffd struct {
 	memfile    block.ReadonlyDevice
 	handler    utils.SetOnce[*userfaultfd.Userfaultfd]
 	fdExit     utils.SetOnce[*fdexit.FdExit]
+	pagePool   *pagepool.PagePool
 }
 
 var _ MemoryBackend = (*Uffd)(nil)
 
-func New(memfile block.ReadonlyDevice, socketPath string) *Uffd {
+func New(memfile block.ReadonlyDevice, socketPath string, pagePool *pagepool.PagePool) *Uffd {
 	return &Uffd{
 		exit:       utils.NewErrorOnce(),
 		readyCh:    make(chan struct{}),
@@ -53,6 +55,7 @@ func New(memfile block.ReadonlyDevice, socketPath string) *Uffd {
 		memfile:    memfile,
 		handler:    *utils.NewSetOnce[*userfaultfd.Userfaultfd](),
 		fdExit:     *utils.NewSetOnce[*fdexit.FdExit](),
+		pagePool:   pagePool,
 	}
 }
 
@@ -169,6 +172,7 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 		u.memfile,
 		m,
 		logger.L().With(logger.WithSandboxID(sandboxId)),
+		u.pagePool,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create uffd: %w", err)

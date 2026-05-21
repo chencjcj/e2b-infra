@@ -29,6 +29,7 @@ type BuilderConfig struct {
 	OrchestratorBaseDir    string        `env:"ORCHESTRATOR_BASE_PATH"   envDefault:"/orchestrator"`
 	SandboxDir             string        `env:"SANDBOX_DIR"              envDefault:"/fc-vm"`
 	SharedChunkCacheDir    string        `env:"SHARED_CHUNK_CACHE_PATH"`
+	EnableSharedMemory     bool          `env:"ENABLE_SHARED_MEMORY"     envDefault:"false"`
 	TemplatesDir           string        `env:"TEMPLATES_DIR,expand"     envDefault:"${ORCHESTRATOR_BASE_PATH}/build-templates"`
 
 	DefaultCacheDir string `env:"DEFAULT_CACHE_DIR,expand" envDefault:"${ORCHESTRATOR_BASE_PATH}/build"`

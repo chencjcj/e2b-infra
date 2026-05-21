@@ -84,15 +84,33 @@ func (p *Prefetcher) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// Skip historically-written pages: they COW into private anon pages on
+	// access, so populating memfd for them wastes a hugepage per offset.
+	accessTypes := p.mapping.AccessTypes
+	hasAccessTypes := len(accessTypes) == len(indices)
+	var filtered []uint64
+	if hasAccessTypes {
+		filtered = make([]uint64, 0, len(indices))
+		for i, idx := range indices {
+			if accessTypes[i] != metadata.AccessWrite {
+				filtered = append(filtered, idx)
+			}
+		}
+	} else {
+		filtered = indices
+	}
+	skippedWrites := len(indices) - len(filtered)
+
 	// Get worker counts from feature flags at runtime
 	maxFetchWorkers := p.featureFlags.IntFlag(ctx, featureflags.MemoryPrefetchMaxFetchWorkers)
 	maxCopyWorkers := p.featureFlags.IntFlag(ctx, featureflags.MemoryPrefetchMaxCopyWorkers)
 
 	blockSize := p.mapping.BlockSize
-	totalPages := len(indices)
+	totalPages := len(filtered)
 
 	span.SetAttributes(
 		attribute.Int64("prefetch.total_pages", int64(totalPages)),
+		attribute.Int64("prefetch.skipped_writes", int64(skippedWrites)),
 		attribute.Int64("prefetch.block_size", blockSize),
 		attribute.Int("prefetch.max_fetch_workers", maxFetchWorkers),
 		attribute.Int("prefetch.max_copy_workers", maxCopyWorkers),
@@ -100,6 +118,7 @@ func (p *Prefetcher) Start(ctx context.Context) error {
 
 	p.logger.Debug(ctx, "prefetch: starting background prefetch",
 		zap.Int("total_pages", totalPages),
+		zap.Int("skipped_writes", skippedWrites),
 		zap.Int64("block_size", blockSize),
 		zap.Int("max_fetch_workers", maxFetchWorkers),
 		zap.Int("max_copy_workers", maxCopyWorkers),
@@ -121,7 +140,7 @@ func (p *Prefetcher) Start(ctx context.Context) error {
 	var copyWg sync.WaitGroup
 
 	// Queue all offsets to fetch in the order they were originally accessed
-	for _, idx := range indices {
+	for _, idx := range filtered {
 		fetchCh <- header.BlockOffset(int64(idx), blockSize)
 	}
 	close(fetchCh)

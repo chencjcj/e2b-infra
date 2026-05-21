@@ -28,6 +28,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/pagepool"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/prefetch"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -270,6 +271,7 @@ type Factory struct {
 	hostStatsDelivery hoststats.Delivery
 	cgroupManager     cgroup.Manager
 	egressProxy       network.EgressProxy
+	pagePools         sync.Map // map[string]*pagepool.PagePool — keyed by buildID
 }
 
 func NewFactory(
@@ -292,6 +294,24 @@ func NewFactory(
 		cgroupManager:     cgroupManager,
 		egressProxy:       egressProxy,
 	}
+}
+
+func (f *Factory) getOrCreatePagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*pagepool.PagePool, error) {
+	if v, ok := f.pagePools.Load(buildID); ok {
+		return v.(*pagepool.PagePool), nil
+	}
+
+	pool, err := pagepool.NewPagePool(buildID, totalSize, pageSize, hugePages)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create page pool for %s: %w", buildID, err)
+	}
+
+	if existing, loaded := f.pagePools.LoadOrStore(buildID, pool); loaded {
+		pool.Close()
+		return existing.(*pagepool.PagePool), nil
+	}
+
+	return pool, nil
 }
 
 // PreBootFn is an optional callback invoked after the rootfs is ready but before
@@ -401,7 +421,7 @@ func (f *Factory) CreateSandbox(
 		}
 	}
 
-	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
+	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName(), cgroupHugetlbLimitMB(f.config.EnableSharedMemory, config))
 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
 
 	cleanup.Add(ctx, func(ctx context.Context) error {
@@ -582,6 +602,7 @@ func (f *Factory) ResumeSandbox(
 
 	// Uffd initialization
 	fcUffdPath := sandboxFiles.SandboxUffdSocketPath()
+	var sharedMemfdPath string
 	uffdPromise := utils.NewPromise(func() (*uffd.Uffd, error) {
 		memfile, err := t.Memfile(ctx)
 		if err != nil {
@@ -590,7 +611,40 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "got template memfile")
 
-		return uffd.New(memfile, fcUffdPath), nil
+		var pool *pagepool.PagePool
+		enableSharedMemory := f.config.EnableSharedMemory
+		// Build sandboxes hit a virtio panic on the memfd resume path; only
+		// user-runtime sandboxes take the shared-memory pool.
+		isBuildSandbox := runtime.SandboxType == SandboxTypeBuild
+		if config.HugePages && enableSharedMemory && !isBuildSandbox {
+			memfileSize, sizeErr := memfile.Size(ctx)
+			if sizeErr != nil {
+				return nil, fmt.Errorf("failed to get memfile size for page pool: %w", sizeErr)
+			}
+
+			logger.L().Info(ctx, "creating shared memory page pool",
+				zap.String("build_id", runtime.BuildID),
+				zap.Int64("memfile_size", memfileSize),
+				zap.Int64("block_size", memfile.BlockSize()),
+			)
+
+			pool, err = f.getOrCreatePagePool(runtime.BuildID, memfileSize, memfile.BlockSize(), config.HugePages)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get page pool: %w", err)
+			}
+
+			sharedMemfdPath = pool.MemfdPath()
+			logger.L().Info(ctx, "shared memory page pool ready",
+				zap.String("memfd_path", sharedMemfdPath),
+				zap.Int("memfd_fd", pool.MemfdFd()),
+			)
+		} else if enableSharedMemory && isBuildSandbox {
+			logger.L().Debug(ctx, "skipping shared memory page pool for build sandbox",
+				zap.String("build_id", runtime.BuildID),
+			)
+		}
+
+		return uffd.New(memfile, fcUffdPath, pool), nil
 	})
 
 	// Prefetching
@@ -723,7 +777,7 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	// Create cgroup for sandbox resource accounting
-	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
+	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName(), cgroupHugetlbLimitMB(f.config.EnableSharedMemory, config))
 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
 
 	cleanup.Add(ctx, func(ctx context.Context) error {
@@ -865,6 +919,7 @@ func (f *Factory) ResumeSandbox(
 			Ops:       fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops),
 			Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth),
 		},
+		sharedMemfdPath,
 	)
 
 	if fcStartErr != nil {
@@ -1218,14 +1273,26 @@ func pauseProcessRootfs(
 	return rootfsDiff, rootfsHeader, nil
 }
 
-// createCgroup creates a cgroup for sandbox resource accounting.
-// The caller is responsible for registering cleanup to remove the cgroup.
-//
-// Returns the CgroupHandle and the cgroup directory FD to pass to the
-// Firecracker process or (nil, cgroup.NoCgroupFD) on error.
-func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName string) (*cgroup.CgroupHandle, int) {
+// cgroupHugetlbLimitMB returns the per-sandbox hugetlb cap, or 0 to disable.
+// Disabled in shared-memory mode because per-sandbox charging breaks the
+// cross-sandbox sharing accounting and aborts fc mid-resume.
+func cgroupHugetlbLimitMB(enableSharedMemory bool, config *Config) int64 {
+	if config == nil {
+		return 0
+	}
+	if enableSharedMemory && config.HugePages {
+		return 0
+	}
+	return config.RamMB
+}
+
+// createCgroup creates a sandbox cgroup and caps its hugepage consumption at
+// ramMB (skipped if 0). Caller registers cleanup. Returns (nil, NoCgroupFD)
+// on error so the sandbox can run unaccounted.
+func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName string, ramMB int64) (*cgroup.CgroupHandle, int) {
 	ctx, span := tracer.Start(ctx, "sandbox-create-cgroup", trace.WithAttributes(
 		attribute.String("cgroup_name", cgroupName),
+		attribute.Int64("ram_mb", ramMB),
 	))
 	defer span.End()
 
@@ -1238,6 +1305,16 @@ func createCgroup(ctx context.Context, cgroupManager cgroup.Manager, cgroupName 
 		telemetry.ReportEvent(ctx, "cgroup creation failed, continuing without accounting")
 
 		return nil, cgroup.NoCgroupFD
+	}
+
+	if ramMB > 0 {
+		limitBytes := uint64(ramMB) * 1024 * 1024
+		if err := handle.SetHugetlbMax(limitBytes); err != nil {
+			logger.L().Warn(ctx, "failed to set hugetlb.2MB.max, sandbox has no per-sandbox hugepage cap",
+				zap.String("cgroup_name", cgroupName),
+				zap.Uint64("limit_bytes", limitBytes),
+				zap.Error(err))
+		}
 	}
 
 	return handle, handle.GetFD()

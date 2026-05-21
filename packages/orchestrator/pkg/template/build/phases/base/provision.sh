@@ -10,6 +10,36 @@ echo "Starting provisioning script"
 # GCP Specific logic
 {{ end }}
 
+# Configure DNS before any network use (align with e2b_val: static resolv.conf so apt/system work).
+# Remove symlink if present (e.g. systemd-resolved); write static nameservers.
+if [ -L /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+fi
+cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 114.114.114.114
+EOF
+# Prevent systemd-resolved from taking over resolv.conf
+if [ -f /etc/systemd/resolved.conf ]; then
+    if ! grep -q "^DNSStubListener=" /etc/systemd/resolved.conf 2>/dev/null; then
+        if grep -q "^\[Resolve\]" /etc/systemd/resolved.conf; then
+            sed -i '/^\[Resolve\]/a DNSStubListener=no' /etc/systemd/resolved.conf 2>/dev/null || true
+        else
+            echo -e "\n[Resolve]\nDNSStubListener=no" >> /etc/systemd/resolved.conf
+        fi
+    else
+        sed -i 's/^DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf 2>/dev/null || true
+    fi
+fi
+mkdir -p /etc/systemd/resolved.conf.d/
+cat > /etc/systemd/resolved.conf.d/dns.conf <<EOF
+[Resolve]
+DNS=8.8.8.8 114.114.114.114
+FallbackDNS=
+Domains=
+DNSSEC=no
+EOF
+
 echo "Making configuration immutable"
 $BUSYBOX chattr +i /etc/resolv.conf
 
@@ -32,8 +62,54 @@ done
 
 if [ -n "$MISSING" ]; then
     echo "Missing packages detected, installing:$MISSING"
-    apt-get -q update
+
+    # Use Aliyun mirror when archive.ubuntu.com is unreachable (e.g. China, restricted network).
+    # Detects Ubuntu/Debian and replaces sources.list so apt can fetch packages.
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO_ID="$ID"
+        CODENAME=$(lsb_release -cs 2>/dev/null || echo "$VERSION_CODENAME")
+        if [ -n "$CODENAME" ]; then
+            case "$DISTRO_ID" in
+                ubuntu)
+                    echo "Detected Ubuntu, using Aliyun mirror for $CODENAME"
+                    cat > /etc/apt/sources.list <<EOF
+deb http://mirrors.aliyun.com/ubuntu/ $CODENAME main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ $CODENAME-updates main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ $CODENAME-backports main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ $CODENAME-security main restricted universe multiverse
+EOF
+                    ;;
+                debian)
+                    echo "Detected Debian, using Aliyun mirror for $CODENAME"
+                    cat > /etc/apt/sources.list <<EOF
+deb http://mirrors.aliyun.com/debian/ $CODENAME main contrib non-free non-free-firmware
+deb http://mirrors.aliyun.com/debian/ $CODENAME-updates main contrib non-free non-free-firmware
+deb http://mirrors.aliyun.com/debian/ $CODENAME-backports main contrib non-free non-free-firmware
+deb http://mirrors.aliyun.com/debian-security/ $CODENAME-security main contrib non-free non-free-firmware
+EOF
+                    ;;
+                *)
+                    echo "Keeping default apt sources for $DISTRO_ID"
+                    ;;
+            esac
+        fi
+    fi
+
+    apt-get -q update || {
+        echo "E: apt-get update failed (no outbound internet from build VM). On the HOST: enable ip_forward, NAT/MASQUERADE for 169.254.0.0/30, or configure HTTP_PROXY for the build."
+        exit 1
+    }
     DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get -qq -o=Dpkg::Use-Pty=0 install -y --no-install-recommends $MISSING
+    # After installing systemd, resolv.conf may have become a symlink again; restore static DNS.
+    if [ -L /etc/resolv.conf ]; then
+        $BUSYBOX chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 114.114.114.114
+EOF
+    fi
 else
     echo "All required packages are already installed."
 fi
