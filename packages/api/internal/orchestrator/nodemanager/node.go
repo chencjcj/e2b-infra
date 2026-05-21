@@ -195,9 +195,8 @@ func (n *Node) OptimisticAdd(ctx context.Context, res SandboxResources) {
 	n.metricsMu.Lock()
 	defer n.metricsMu.Unlock()
 
-	// Directly accumulate to the current metrics view
 	n.metrics.CpuAllocated += uint32(res.CPUs)
-	n.metrics.MemoryAllocatedBytes += uint64(res.MiBMemory) * 1024 * 1024 // Note: CpuPercent is difficult to estimate, usually just updating Allocated is sufficient for the scheduling algorithm
+	n.metrics.MemoryAllocatedBytes += uint64(res.MiBMemory) * 1024 * 1024
 }
 
 func (n *Node) OptimisticRemove(ctx context.Context, res SandboxResources) {
@@ -208,7 +207,6 @@ func (n *Node) OptimisticRemove(ctx context.Context, res SandboxResources) {
 	n.metricsMu.Lock()
 	defer n.metricsMu.Unlock()
 
-	// Directly subtract from the current metrics view
 	n.metrics.CpuAllocated -= uint32(res.CPUs)
 	n.metrics.MemoryAllocatedBytes -= uint64(res.MiBMemory) * 1024 * 1024
 }

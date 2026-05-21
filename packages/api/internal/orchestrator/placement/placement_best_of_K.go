@@ -24,14 +24,19 @@ type BestOfKConfig struct {
 	TooManyStarting bool
 	// CanFit determines whether to skip the node CanFit check
 	CanFit bool
+	// HugepagesSoftWatermark is the max in-use fraction of the node hugepage
+	// pool before placement rejects the node. 0 disables the gate; nodes
+	// with HugepagesTotalBytes==0 are always allowed.
+	HugepagesSoftWatermark float64
 }
 
 // DefaultBestOfKConfig returns the default placement configuration
 func DefaultBestOfKConfig() BestOfKConfig {
 	return BestOfKConfig{
-		R:     4,
-		K:     3,
-		Alpha: 0.5,
+		R:                      4,
+		K:                      3,
+		Alpha:                  0.5,
+		HugepagesSoftWatermark: 0.80,
 	}
 }
 
@@ -79,6 +84,22 @@ func (b *BestOfK) CanFit(node *nodemanager.Node, sandboxResources nodemanager.Sa
 	totalCapacity := config.R * cpuCount
 
 	return float64(reserved+uint32(sandboxResources.CPUs)) <= totalCapacity
+}
+
+// CanFitHugepages reports whether the node is below the hugepage soft watermark.
+func (b *BestOfK) CanFitHugepages(node *nodemanager.Node, config BestOfKConfig) bool {
+	if config.HugepagesSoftWatermark <= 0 {
+		return true
+	}
+
+	metrics := node.Metrics()
+	total := metrics.HugepagesTotalBytes
+	if total == 0 {
+		return true
+	}
+
+	used := total - metrics.HugepagesFreeBytes
+	return float64(used)/float64(total) < config.HugepagesSoftWatermark
 }
 
 // BestOfK implements the fit-score-place algorithm
@@ -185,6 +206,9 @@ func (b *BestOfK) sample(items []*nodemanager.Node, config BestOfKConfig, exclud
 
 		if config.CanFit {
 			if !b.CanFit(n, resources, config) {
+				continue
+			}
+			if !b.CanFitHugepages(n, config) {
 				continue
 			}
 		}

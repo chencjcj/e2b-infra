@@ -69,6 +69,10 @@ message ServiceInfoResponse {
 
   // Detailed disk metrics for each mount point
   repeated DiskMetrics metric_disks = 113;
+
+  // Node hugepage pool — used for memory-pressure aware placement/eviction.
+  uint64 metric_hugepages_total_bytes = 114;
+  uint64 metric_hugepages_free_bytes  = 115;
 }
 
 message ServiceStatusChangeRequest {

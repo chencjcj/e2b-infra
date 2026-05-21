@@ -174,6 +174,25 @@ func (h *CgroupHandle) SetHugetlbMax(bytes uint64) error {
 	return nil
 }
 
+// MemoryCurrent reads memory.current without touching the memory.peak FD
+// used by GetStats. Returns (0, nil) for nil / noop handles and when the
+// cgroup directory has already been removed (ENOENT).
+func (h *CgroupHandle) MemoryCurrent() (uint64, error) {
+	if h == nil || h.noop {
+		return 0, nil
+	}
+
+	data, err := os.ReadFile(filepath.Join(h.path, "memory.current"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to read memory.current: %w", err)
+	}
+
+	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+}
+
 // Manager handles initialization and creation of cgroups
 // Individual cgroup operations are performed through CgroupHandle
 type Manager interface {

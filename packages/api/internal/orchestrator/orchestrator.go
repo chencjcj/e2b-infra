@@ -325,11 +325,20 @@ func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Clie
 	alpha := float64(alphaPercent) / 100.0
 	maxOvercommit := float64(maxOvercommitPercent) / 100.0
 
+	// Hugepage soft watermark is sourced from the process env (injected via
+	// Nomad job config) and re-read on every reload so a restart is not
+	// required to pick up a value change in a long-running deployment where
+	// env can be mutated (rare, but cheap to support). Invalid or zero means
+	// "disabled".
+	hugepagesSoftWatermarkPercent, _ := env.GetEnvAsInt("PLACEMENT_HUGEPAGES_SOFT_WATERMARK_PERCENT", 80)
+	hugepagesSoftWatermark := float64(hugepagesSoftWatermarkPercent) / 100.0
+
 	return placement.BestOfKConfig{
-		R:               maxOvercommit,
-		K:               k,
-		Alpha:           alpha,
-		CanFit:          canFit,
-		TooManyStarting: tooManyStarting,
+		R:                      maxOvercommit,
+		K:                      k,
+		Alpha:                  alpha,
+		CanFit:                 canFit,
+		TooManyStarting:        tooManyStarting,
+		HugepagesSoftWatermark: hugepagesSoftWatermark,
 	}
 }

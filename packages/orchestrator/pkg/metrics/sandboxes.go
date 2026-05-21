@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/procstats"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -61,6 +62,12 @@ type SandboxObserver struct {
 	memoryCache metric.Int64ObservableGauge
 	diskTotal   metric.Int64ObservableGauge
 	diskUsed    metric.Int64ObservableGauge
+
+	// Host-sourced gauges — read from /proc and cgroup, not envd. These are
+	// observed for every live sandbox regardless of envd version / clickhouse
+	// metrics opt-in.
+	hugepagesUsed  metric.Int64ObservableGauge
+	memoryCurrent  metric.Int64ObservableGauge
 }
 
 func NewSandboxObserver(ctx context.Context, nodeID, serviceName, serviceCommit, serviceVersion, serviceInstanceID string, sandboxes *sandbox.Map) (*SandboxObserver, error) {
@@ -125,6 +132,16 @@ func NewSandboxObserver(ctx context.Context, nodeID, serviceName, serviceCommit,
 		return nil, fmt.Errorf("failed to create disk used gauge: %w", err)
 	}
 
+	hugepagesUsed, err := telemetry.GetGaugeInt(meter, telemetry.SandboxHugepagesUsedGaugeName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sandbox hugepages used gauge: %w", err)
+	}
+
+	memoryCurrent, err := telemetry.GetGaugeInt(meter, telemetry.SandboxMemoryCurrentGaugeName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sandbox memory.current gauge: %w", err)
+	}
+
 	so := &SandboxObserver{
 		exportInterval: sandboxMetricExportPeriod,
 		meterExporter:  externalMeterExporter,
@@ -137,6 +154,8 @@ func NewSandboxObserver(ctx context.Context, nodeID, serviceName, serviceCommit,
 		memoryCache:    memoryCache,
 		diskTotal:      diskTotal,
 		diskUsed:       diskUsed,
+		hugepagesUsed:  hugepagesUsed,
+		memoryCurrent:  memoryCurrent,
 	}
 
 	registration, err := so.startObserving()
@@ -161,21 +180,48 @@ func (so *SandboxObserver) startObserving() (metric.Registration, error) {
 			wg.SetLimit(int(limit))
 
 			for _, sbx := range so.sandboxes.Items() {
-				ok, err := utils.IsGTEVersion(sbx.Config.Envd.Version, minEnvdVersionForMetrics)
-				if err != nil {
-					logger.L().Error(ctx, "Failed to check envd version", zap.Error(err), logger.WithSandboxID(sbx.Runtime.SandboxID))
-
-					continue
-				}
-				if !ok {
-					continue
-				}
-
-				if !sbx.Checks.UseClickhouseMetrics {
-					continue
-				}
-
 				wg.Go(func() error {
+					// Build attributes up front — used by both host-sourced and envd-sourced observations.
+					attributes := metric.WithAttributes(
+						attribute.String("sandbox_id", sbx.Runtime.SandboxID),
+						attribute.String("team_id", sbx.Runtime.TeamID),
+						attribute.String("build_id", sbx.Runtime.BuildID),
+						attribute.String("sandbox_type", sbx.Runtime.SandboxType.String()),
+					)
+
+					// Host-sourced metrics — fired regardless of envd availability.
+					// sbx.Pid() errors during the startup window before fc is forked.
+					if pid, perr := sbx.Pid(); perr == nil {
+						hugetlb, herr := procstats.ReadHugetlbBytes(pid)
+						if herr != nil {
+							logger.L().Debug(ctx, "failed to read sandbox hugetlb bytes",
+								logger.WithSandboxID(sbx.Runtime.SandboxID), zap.Int("pid", pid), zap.Error(herr))
+						} else {
+							o.ObserveInt64(so.hugepagesUsed, safeInt64(hugetlb), attributes)
+						}
+					}
+					if memCur, merr := sbx.MemoryCurrent(); merr == nil {
+						if memCur > 0 {
+							o.ObserveInt64(so.memoryCurrent, safeInt64(memCur), attributes)
+						}
+					} else {
+						logger.L().Debug(ctx, "failed to read sandbox cgroup memory.current",
+							logger.WithSandboxID(sbx.Runtime.SandboxID), zap.Error(merr))
+					}
+
+					// Envd-sourced metrics are gated on envd version and opt-in.
+					ok, err := utils.IsGTEVersion(sbx.Config.Envd.Version, minEnvdVersionForMetrics)
+					if err != nil {
+						logger.L().Error(ctx, "Failed to check envd version", zap.Error(err), logger.WithSandboxID(sbx.Runtime.SandboxID))
+						return nil
+					}
+					if !ok {
+						return nil
+					}
+					if !sbx.Checks.UseClickhouseMetrics {
+						return nil
+					}
+
 					// Make sure the sandbox doesn't change while we are getting metrics (the slot could be assigned to another sandbox)
 					sbxMetrics, err := sbx.Checks.GetMetrics(ctx, timeoutGetMetrics)
 					if err != nil {
@@ -186,8 +232,6 @@ func (so *SandboxObserver) startObserving() (metric.Registration, error) {
 
 						return err
 					}
-
-					attributes := metric.WithAttributes(attribute.String("sandbox_id", sbx.Runtime.SandboxID), attribute.String("team_id", sbx.Runtime.TeamID), attribute.String("build_id", sbx.Runtime.BuildID), attribute.String("sandbox_type", sbx.Runtime.SandboxType.String()))
 
 					ok, err = utils.IsGTEVersion(sbx.Config.Envd.Version, minEnvVersionForMetricsTimestamp)
 					if err != nil {
@@ -221,7 +265,7 @@ func (so *SandboxObserver) startObserving() (metric.Registration, error) {
 					var memoryTotal int64
 					var memoryUsed int64
 
-					ok, err := utils.IsGTEVersion(sbx.Config.Envd.Version, minEnvdVersionForMemoryPrecise)
+					ok, err = utils.IsGTEVersion(sbx.Config.Envd.Version, minEnvdVersionForMemoryPrecise)
 					if err != nil {
 						logger.L().Error(ctx, "Failed to check envd version for memory metrics", zap.Error(err), logger.WithSandboxID(sbx.Runtime.SandboxID))
 					}
@@ -282,7 +326,7 @@ func (so *SandboxObserver) startObserving() (metric.Registration, error) {
 			}
 
 			return nil
-		}, so.cpuTotal, so.cpuUsed, so.memoryTotal, so.memoryUsed, so.memoryCache, so.diskTotal, so.diskUsed)
+		}, so.cpuTotal, so.cpuUsed, so.memoryTotal, so.memoryUsed, so.memoryCache, so.diskTotal, so.diskUsed, so.hugepagesUsed, so.memoryCurrent)
 	if err != nil {
 		return nil, err
 	}

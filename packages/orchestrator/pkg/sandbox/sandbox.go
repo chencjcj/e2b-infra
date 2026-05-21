@@ -246,6 +246,29 @@ func (s *Sandbox) LoggerMetadata() sbxlogger.SandboxMetadata {
 	}
 }
 
+// Pid returns the OS PID of the sandbox's Firecracker process.
+// Returns an error when the process has not been started yet.
+func (s *Sandbox) Pid() (int, error) {
+	if s.process == nil {
+		return 0, errors.New("fc process not initialized")
+	}
+	return s.process.Pid()
+}
+
+// MemoryCurrent returns the sandbox cgroup's memory.current value in bytes.
+// Returns (0, nil) when no real cgroup is attached (noop handle) or when
+// the cgroup has already been removed.
+func (s *Sandbox) MemoryCurrent() (uint64, error) {
+	return s.cgroupHandle.MemoryCurrent()
+}
+
+func (s *Sandbox) LastFatalReason() string {
+	if s.Resources == nil || s.Resources.memory == nil {
+		return ""
+	}
+	return s.Resources.memory.LastFatalReason()
+}
+
 // GetStartedAt returns the sandbox start time in a thread-safe manner.
 func (m *Metadata) GetStartedAt() time.Time {
 	m.rwmu.RLock()

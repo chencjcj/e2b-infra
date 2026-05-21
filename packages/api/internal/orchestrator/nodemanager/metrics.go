@@ -22,6 +22,11 @@ type Metrics struct {
 	MemoryTotalBytes     uint64
 	SandboxCount         uint32
 
+	// HugepagesTotalBytes == 0 means the node has no hugepage pool
+	// (e.g. builder/dev nodes); callers must treat this as "no limit".
+	HugepagesTotalBytes uint64
+	HugepagesFreeBytes  uint64
+
 	// Detailed disk metrics
 	HostDisks []DiskMetrics
 }
@@ -44,6 +49,9 @@ func (n *Node) UpdateMetricsFromServiceInfoResponse(info *orchestratorinfo.Servi
 
 	// Update total sandbox count
 	n.metrics.SandboxCount = info.GetMetricSandboxesRunning()
+
+	n.metrics.HugepagesTotalBytes = info.GetMetricHugepagesTotalBytes()
+	n.metrics.HugepagesFreeBytes = info.GetMetricHugepagesFreeBytes()
 
 	// Update detailed disk metrics
 	disks := info.GetMetricDisks()
@@ -71,6 +79,9 @@ func (n *Node) Metrics() Metrics {
 		MemoryUsedBytes:      n.metrics.MemoryUsedBytes,
 		MemoryTotalBytes:     n.metrics.MemoryTotalBytes,
 		SandboxCount:         n.metrics.SandboxCount,
+
+		HugepagesTotalBytes: n.metrics.HugepagesTotalBytes,
+		HugepagesFreeBytes:  n.metrics.HugepagesFreeBytes,
 
 		HostDisks: make([]DiskMetrics, len(n.metrics.HostDisks)),
 	}

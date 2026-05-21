@@ -17,4 +17,8 @@ type MemoryBackend interface {
 	Stop() error
 	Ready() chan struct{}
 	Exit() *utils.ErrorOnce
+	// LastFatalReason returns a short tag classifying why the backend failed,
+	// or empty if it has not failed (or failed for an unclassified reason).
+	// Currently the only classified cause is "hugepage_oom".
+	LastFatalReason() string
 }

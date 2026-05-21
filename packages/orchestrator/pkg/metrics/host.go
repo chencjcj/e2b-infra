@@ -31,6 +31,15 @@ type MemoryMetrics struct {
 	TotalBytes uint64
 }
 
+// HugepageMetrics is the cached snapshot of the node's hugetlb pool parsed
+// from /proc/meminfo. Sampled on the same 10s tick as CPU/memory/disk.
+type HugepageMetrics struct {
+	TotalBytes    uint64
+	FreeBytes     uint64
+	ReservedBytes uint64
+	SurplusBytes  uint64
+}
+
 type DiskInfo struct {
 	MountPoint     string
 	Device         string
@@ -45,15 +54,17 @@ type DiskInfo struct {
 // All metrics are sampled together on the same tick, producing a
 // consistent snapshot.
 type HostMetrics struct {
-	mu         sync.RWMutex
-	cpu        *CPUMetrics
-	cpuErr     error
-	memory     *MemoryMetrics
-	memoryErr  error
-	disks      []DiskInfo
-	disksErr   error
-	closed     chan struct{}
-	closedOnce sync.Once
+	mu           sync.RWMutex
+	cpu          *CPUMetrics
+	cpuErr       error
+	memory       *MemoryMetrics
+	memoryErr    error
+	disks        []DiskInfo
+	disksErr     error
+	hugepages    *HugepageMetrics
+	hugepagesErr error
+	closed       chan struct{}
+	closedOnce   sync.Once
 }
 
 func NewHostMetrics() *HostMetrics {
@@ -124,12 +135,26 @@ func (h *HostMetrics) GetDiskMetrics() ([]DiskInfo, error) {
 	return h.disks, nil
 }
 
+// GetHugepageMetrics returns the most recent hugepage pool sample. Non-blocking.
+// Returns zero-value HugepageMetrics if no sample has been taken yet.
+func (h *HostMetrics) GetHugepageMetrics() (*HugepageMetrics, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.hugepages == nil {
+		return &HugepageMetrics{}, h.hugepagesErr
+	}
+
+	return h.hugepages, nil
+}
+
 // sample resamples all host metrics and writes them atomically so that
 // readers always see a consistent snapshot (all metrics from the same tick).
 func (h *HostMetrics) sample() {
 	cpu, cpuErr := readCPU()
 	memory, memErr := readMemory()
 	disks, disksErr := readDisk()
+	hugepages, hpErr := readHugepages()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -148,6 +173,27 @@ func (h *HostMetrics) sample() {
 		h.disks = disks
 	}
 	h.disksErr = disksErr
+
+	if hpErr == nil {
+		h.hugepages = hugepages
+	}
+	h.hugepagesErr = hpErr
+}
+
+// readHugepages parses /proc/meminfo and returns the pool state in bytes.
+// On systems without hugepages configured, TotalBytes == 0 is returned as a
+// valid (non-error) snapshot.
+func readHugepages() (*HugepageMetrics, error) {
+	total, free, rsvd, surp, err := readHugepagesFromMeminfo()
+	if err != nil {
+		return nil, err
+	}
+	return &HugepageMetrics{
+		TotalBytes:    total,
+		FreeBytes:     free,
+		ReservedBytes: rsvd,
+		SurplusBytes:  surp,
+	}, nil
 }
 
 func readCPU() (*CPUMetrics, error) {

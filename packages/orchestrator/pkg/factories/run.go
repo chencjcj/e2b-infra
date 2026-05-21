@@ -35,6 +35,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/hyperloopserver"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/localupload"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/metrics"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/pressure"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/nfsproxy"
 	nfscfg "github.com/e2b-dev/infra/packages/orchestrator/pkg/nfsproxy/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/portmap"
@@ -467,6 +468,12 @@ func run(config cfg.Config, opts Options) (success bool) {
 	}
 	closers = append(closers, closer{"sandbox observer", sandboxObserver.Close})
 
+	nodeObserver, err := metrics.NewNodeObserver(ctx, nodeID, serviceName, commitSHA, version, serviceInstanceID)
+	if err != nil {
+		logger.L().Fatal(ctx, "failed to create node observer", zap.Error(err))
+	}
+	closers = append(closers, closer{"node observer", nodeObserver.Close})
+
 	// host metrics — samples CPU in the background so GetCPUMetrics is a
 	// non-blocking cache read on the request path.
 	hostMetrics := metrics.NewHostMetrics()
@@ -565,6 +572,22 @@ func run(config cfg.Config, opts Options) (success bool) {
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to create orchestrator server", zap.Error(err))
 	}
+
+	pressureHardWatermarkPercent, _ := env.GetEnvAsInt("PRESSURE_HARD_WATERMARK_PERCENT", 90)
+	pressureTickIntervalMs, _ := env.GetEnvAsInt("PRESSURE_TICK_INTERVAL_MS", 5000)
+	pressureActionCooldownMs, _ := env.GetEnvAsInt("PRESSURE_ACTION_COOLDOWN_MS", 30000)
+	pressureMonitor := pressure.NewMonitor(sandboxes, hostMetrics, orchestratorService.StopRunningSandbox, pressure.Options{
+		HardWatermark:  float64(pressureHardWatermarkPercent) / 100.0,
+		TickInterval:   time.Duration(pressureTickIntervalMs) * time.Millisecond,
+		ActionCooldown: time.Duration(pressureActionCooldownMs) * time.Millisecond,
+	})
+	if err := pressureMonitor.Validate(); err != nil {
+		logger.L().Fatal(ctx, "failed to validate pressure monitor", zap.Error(err))
+	}
+	startService("pressure monitor", func() error {
+		return pressureMonitor.Start(ctx)
+	})
+	closers = append(closers, closer{"pressure monitor", pressureMonitor.Close})
 
 	// template manager sandbox logger
 	tmplSbxLoggerExternal := sbxlogger.NewLogger(
