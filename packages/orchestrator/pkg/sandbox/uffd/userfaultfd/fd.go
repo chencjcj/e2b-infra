@@ -25,6 +25,13 @@ struct uffd_remove {
 	__u64 start;
 	__u64 end;
 };
+
+struct e2b_uffdio_continue {
+	__u64 start;
+	__u64 len;
+	__u64 mode;
+	__s64 mapped;
+};
 */
 import "C"
 
@@ -66,6 +73,15 @@ const (
 	UFFD_FEATURE_MISSING_HUGETLBFS = C.UFFD_FEATURE_MISSING_HUGETLBFS
 	UFFD_FEATURE_EVENT_REMOVE      = C.UFFD_FEATURE_EVENT_REMOVE
 	UFFD_FEATURE_WP_ASYNC          = C.UFFD_FEATURE_WP_ASYNC
+
+	// Hardcoded because CGo cannot resolve the __u64 casts / _IOWR macro.
+	// Values from linux/userfaultfd.h (kernel 6.8).
+	UFFD_FEATURE_MINOR_HUGETLBFS  = 1 << 9
+	UFFD_FEATURE_MINOR_SHMEM      = 1 << 10
+	UFFDIO_REGISTER_MODE_MINOR    = 1 << 2
+	UFFDIO_CONTINUE               = 0xC020AA07
+	UFFDIO_CONTINUE_MODE_DONTWAKE = 1 << 0
+	UFFDIO_CONTINUE_MODE_WP       = 1 << 1
 )
 
 type (
@@ -83,6 +99,7 @@ type (
 	UffdioCopy         = C.struct_uffdio_copy
 	UffdioZero         = C.struct_uffdio_zeropage
 	UffdioWriteProtect = C.struct_uffdio_writeprotect
+	UffdioContinue     = C.struct_e2b_uffdio_continue
 )
 
 func newUffdioAPI(api, features CULong) UffdioAPI {
@@ -128,6 +145,15 @@ func newUffdioWriteProtect(address, pagesize, mode CULong) UffdioWriteProtect {
 	return UffdioWriteProtect{
 		_range: newUffdioRange(address, pagesize),
 		mode:   mode,
+	}
+}
+
+func newUffdioContinue(address, pagesize, mode CULong) UffdioContinue {
+	return UffdioContinue{
+		start:  address,
+		len:    pagesize,
+		mode:   mode,
+		mapped: 0,
 	}
 }
 
@@ -193,6 +219,20 @@ func (f Fd) wake(addr, pagesize uintptr) error {
 
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_WAKE, uintptr(unsafe.Pointer(&uffdRange))); errno != 0 {
 		return errno
+	}
+
+	return nil
+}
+
+func (f Fd) continueMapping(addr, pagesize uintptr, mode CULong) error {
+	cont := newUffdioContinue(CULong(addr)&^CULong(pagesize-1), CULong(pagesize), mode)
+
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_CONTINUE, uintptr(unsafe.Pointer(&cont))); errno != 0 {
+		return errno
+	}
+
+	if cont.mapped != CLong(pagesize) {
+		return fmt.Errorf("UFFDIO_CONTINUE mapped %d bytes, expected %d", cont.mapped, pagesize)
 	}
 
 	return nil

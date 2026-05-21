@@ -25,6 +25,9 @@ type MemoryBackend struct {
 	// Required: true
 	// Enum: ["File","Uffd"]
 	BackendType *string `json:"backend_type"`
+
+	// /proc/self/fd/<N> path to the shared memfd. When set, FC mmaps guest memory MAP_PRIVATE and registers UFFDIO_REGISTER_MODE_MINOR.
+	SharedMemfdPath string `json:"shared_memfd_path,omitempty"`
 }
 
 // Validate validates this memory backend

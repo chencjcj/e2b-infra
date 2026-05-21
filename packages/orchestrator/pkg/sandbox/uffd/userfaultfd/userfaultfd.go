@@ -1,11 +1,14 @@
 package userfaultfd
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -20,6 +23,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/fdexit"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/memory"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/pagepool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
@@ -63,11 +67,70 @@ type Userfaultfd struct {
 	// defaultCopyMode overrides the UFFDIO_COPY mode for all faults when non-zero.
 	defaultCopyMode CULong
 
+	// When set, MINOR faults resolve via UFFDIO_CONTINUE.
+	pagePool *pagepool.PagePool
+
+	totalMinor        atomic.Uint64
+	totalMissingRead  atomic.Uint64
+	totalMissingWrite atomic.Uint64
+
+	// Enabled by UFFD_FAULT_TRACE_DIR.
+	faultTrace *faultTracer
+
 	logger logger.Logger
 }
 
-// NewUserfaultfdFromFd creates a new userfaultfd instance with optional configuration.
-func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logger logger.Logger) (*Userfaultfd, error) {
+const (
+	faultTypeMinorRead    = 0
+	faultTypeMinorWrite   = 1
+	faultTypeMissingRead  = 2
+	faultTypeMissingWrite = 3
+)
+
+// Format per line: "<ns_since_start> <offset> <type>".
+type faultTracer struct {
+	mu      sync.Mutex
+	w       *bufio.Writer
+	f       *os.File
+	startNs int64
+}
+
+func newFaultTracer(path string) (*faultTracer, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &faultTracer{
+		w:       bufio.NewWriterSize(f, 64*1024),
+		f:       f,
+		startNs: time.Now().UnixNano(),
+	}, nil
+}
+
+func (t *faultTracer) Record(offset int64, faultType int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delta := time.Now().UnixNano() - t.startNs
+	fmt.Fprintf(t.w, "%d %d %d\n", delta, offset, faultType)
+	t.w.Flush()
+}
+
+func (t *faultTracer) RecordRaw(offset int64, rawFlags uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delta := time.Now().UnixNano() - t.startNs
+	fmt.Fprintf(t.w, "R %d %d 0x%x\n", delta, offset, rawFlags)
+	t.w.Flush()
+}
+
+func (t *faultTracer) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.w.Flush()
+	return t.f.Close()
+}
+
+func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logger logger.Logger, pagePool *pagepool.PagePool) (*Userfaultfd, error) {
 	blockSize := src.BlockSize()
 
 	for _, region := range m.Regions {
@@ -83,7 +146,19 @@ func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logge
 		pageTracker:     newPageTracker(uintptr(blockSize)),
 		prefetchTracker: block.NewPrefetchTracker(blockSize),
 		ma:              m,
+		pagePool:        pagePool,
 		logger:          logger,
+	}
+
+	if dir := os.Getenv("UFFD_FAULT_TRACE_DIR"); dir != "" {
+		path := fmt.Sprintf("%s/uffd-trace-%d-%d.log", dir, os.Getpid(), time.Now().UnixNano())
+		tracer, err := newFaultTracer(path)
+		if err != nil {
+			logger.Warn(context.Background(), "failed to create fault tracer", zap.String("path", path), zap.Error(err))
+		} else {
+			u.faultTrace = tracer
+			logger.Info(context.Background(), "UFFD fault trace enabled", zap.String("path", path))
+		}
 	}
 
 	// By default this was unlimited.
@@ -95,6 +170,11 @@ func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logge
 }
 
 func (u *Userfaultfd) Close() error {
+	if u.faultTrace != nil {
+		if err := u.faultTrace.Close(); err != nil {
+			u.logger.Warn(context.Background(), "failed to close fault trace", zap.Error(err))
+		}
+	}
 	return u.fd.close()
 }
 
@@ -233,6 +313,7 @@ func (u *Userfaultfd) Serve(
 		eagainCounter.Log(ctx)
 		noDataCounter.Log(ctx)
 
+		var minorCount, missingReadCount, missingWriteCount int
 		for _, pagefault := range pagefaults {
 			flags := pagefault.flags
 
@@ -245,10 +326,35 @@ func (u *Userfaultfd) Serve(
 				return fmt.Errorf("failed to map: %w", err)
 			}
 
-			// Handle write to missing page (WRITE flag)
-			// If the event has WRITE flag, it was a write to a missing page.
-			// For the write to be executed, we first need to copy the page from the source to the guest memory.
+			if u.faultTrace != nil {
+				u.faultTrace.RecordRaw(offset, uint64(flags))
+			}
+
+			// Check MINOR before WRITE: MINOR+WRITE still needs UFFDIO_CONTINUE.
+			if flags&UFFD_PAGEFAULT_FLAG_MINOR != 0 && u.pagePool != nil {
+				minorCount++
+				accessType := block.Read
+				traceType := faultTypeMinorRead
+				if flags&UFFD_PAGEFAULT_FLAG_WRITE != 0 {
+					accessType = block.Write
+					traceType = faultTypeMinorWrite
+				}
+				if u.faultTrace != nil {
+					u.faultTrace.Record(offset, traceType)
+				}
+
+				u.wg.Go(func() error {
+					return u.faultPageContinue(ctx, addr, offset, u.src, fdExit.SignalExit, accessType)
+				})
+
+				continue
+			}
+
 			if flags&UFFD_PAGEFAULT_FLAG_WRITE != 0 {
+				missingWriteCount++
+				if u.faultTrace != nil {
+					u.faultTrace.Record(offset, faultTypeMissingWrite)
+				}
 				u.wg.Go(func() error {
 					return u.faultPage(ctx, addr, offset, u.src, fdExit.SignalExit, block.Write)
 				})
@@ -256,9 +362,11 @@ func (u *Userfaultfd) Serve(
 				continue
 			}
 
-			// Handle read to missing page ("MISSING" flag)
-			// If the event has no flags, it was a read to a missing page and we need to copy the page from the source to the guest memory.
 			if flags == 0 {
+				missingReadCount++
+				if u.faultTrace != nil {
+					u.faultTrace.Record(offset, faultTypeMissingRead)
+				}
 				u.wg.Go(func() error {
 					return u.faultPage(ctx, addr, offset, u.src, fdExit.SignalExit, block.Read)
 				})
@@ -266,10 +374,29 @@ func (u *Userfaultfd) Serve(
 				continue
 			}
 
-			// MINOR and WP flags are not expected as we don't register the uffd with these flags.
+			u.logger.Warn(ctx, "UFFD unexpected fault flags", zap.Uint64("flags", uint64(flags)), zap.Uintptr("addr", addr))
 			return fmt.Errorf("unexpected event type: %d, closing uffd", flags)
 		}
+
+		if minorCount > 0 || missingReadCount > 0 || missingWriteCount > 0 {
+			u.totalMinor.Add(uint64(minorCount))
+			u.totalMissingRead.Add(uint64(missingReadCount))
+			u.totalMissingWrite.Add(uint64(missingWriteCount))
+
+			u.logger.Debug(ctx, "uffd fault batch",
+				zap.Int("minor", minorCount),
+				zap.Int("missing_read", missingReadCount),
+				zap.Int("missing_write", missingWriteCount),
+				zap.Uint64("total_minor", u.totalMinor.Load()),
+				zap.Uint64("total_missing_read", u.totalMissingRead.Load()),
+				zap.Uint64("total_missing_write", u.totalMissingWrite.Load()),
+			)
+		}
 	}
+}
+
+func (u *Userfaultfd) FaultCounts() (minor, missingRead, missingWrite uint64) {
+	return u.totalMinor.Load(), u.totalMissingRead.Load(), u.totalMissingWrite.Load()
 }
 
 func (u *Userfaultfd) PrefetchData() block.PrefetchData {
@@ -356,6 +483,35 @@ retryLoop:
 		return fmt.Errorf("failed to read from source after %d attempts: %w", attempt+1, joinedErr)
 	}
 
+	// READ: populate memfd + WAKE → retry fires as MINOR → faultPageContinue
+	// installs a shared PTE. WRITE/Prefetch COW into private anon, so memfd
+	// population would just waste a hugepage.
+	if u.pagePool != nil && accessType == block.Read {
+		if populateErr := u.pagePool.EnsurePagePopulatedDirect(offset, b); populateErr != nil {
+			signalErr := safeInvoke(onFailure)
+			joinedErr := errors.Join(populateErr, signalErr)
+			span.RecordError(joinedErr)
+			u.logger.Error(ctx, "UFFD serve populate memfd error", zap.Error(joinedErr))
+			return fmt.Errorf("failed to populate memfd at offset %d: %w", offset, joinedErr)
+		}
+
+		wakeErr := u.fd.wake(addr, u.pageSize)
+		if errors.Is(wakeErr, unix.ESRCH) {
+			span.SetAttributes(attribute.Bool("uffd.process_exited", true))
+			u.logger.Debug(ctx, "UFFD serve wake: process no longer exists", zap.Error(wakeErr))
+			return nil
+		}
+		if wakeErr != nil {
+			signalErr := safeInvoke(onFailure)
+			joinedErr := errors.Join(wakeErr, signalErr)
+			span.RecordError(joinedErr)
+			u.logger.Error(ctx, "UFFD serve uffdio wake error", zap.Error(joinedErr))
+			return fmt.Errorf("failed uffdio wake: %w", joinedErr)
+		}
+
+		return nil
+	}
+
 	copyMode := u.defaultCopyMode
 
 	// Performing copy() on UFFD clears the WP bit unless we explicitly tell
@@ -366,6 +522,7 @@ retryLoop:
 	}
 
 	copyErr := u.fd.copy(addr, u.pageSize, b, copyMode)
+
 	if errors.Is(copyErr, unix.EEXIST) {
 		// Page is already mapped
 		span.SetAttributes(attribute.Bool("uffd.already_mapped", true))
@@ -392,6 +549,69 @@ retryLoop:
 		u.logger.Error(ctx, "UFFD serve uffdio copy error", zap.Error(joinedErr))
 
 		return fmt.Errorf("failed uffdio copy: %w", joinedErr)
+	}
+
+	u.pageTracker.setState(addr, addr+u.pageSize, faulted)
+	u.prefetchTracker.Add(offset, accessType)
+
+	return nil
+}
+
+func (u *Userfaultfd) faultPageContinue(
+	ctx context.Context,
+	addr uintptr,
+	offset int64,
+	source block.Slicer,
+	onFailure func() error,
+	accessType block.AccessType,
+) error {
+	span := trace.SpanFromContext(ctx)
+
+	u.settleRequests.RLock()
+	defer u.settleRequests.RUnlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Error(ctx, "UFFD serve panic in faultPageContinue", zap.Any("pagesize", u.pageSize), zap.Any("panic", r))
+		}
+	}()
+
+	_, populateErr := u.pagePool.EnsurePagePopulated(ctx, offset, source)
+	if populateErr != nil {
+		signalErr := safeInvoke(onFailure)
+		joinedErr := errors.Join(populateErr, signalErr)
+
+		span.RecordError(joinedErr)
+		u.logger.Error(ctx, "UFFD serve page pool populate error", zap.Error(joinedErr))
+
+		return fmt.Errorf("failed to populate page pool at offset %d: %w", offset, joinedErr)
+	}
+
+	continueMode := CULong(0)
+	if accessType != block.Write {
+		continueMode |= UFFDIO_CONTINUE_MODE_WP
+	}
+
+	contErr := u.fd.continueMapping(addr, u.pageSize, continueMode)
+	if errors.Is(contErr, unix.EEXIST) {
+		span.SetAttributes(attribute.Bool("uffd.already_mapped", true))
+		return nil
+	}
+
+	if errors.Is(contErr, unix.ESRCH) {
+		span.SetAttributes(attribute.Bool("uffd.process_exited", true))
+		u.logger.Debug(ctx, "UFFDIO_CONTINUE: process no longer exists", zap.Error(contErr))
+		return nil
+	}
+
+	if contErr != nil {
+		signalErr := safeInvoke(onFailure)
+		joinedErr := errors.Join(contErr, signalErr)
+
+		span.RecordError(joinedErr)
+		u.logger.Error(ctx, "UFFD serve uffdio continue error", zap.Error(joinedErr))
+
+		return fmt.Errorf("failed uffdio continue: %w", joinedErr)
 	}
 
 	u.pageTracker.setState(addr, addr+u.pageSize, faulted)

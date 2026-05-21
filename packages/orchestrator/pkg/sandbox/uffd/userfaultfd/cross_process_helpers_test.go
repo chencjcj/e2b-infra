@@ -311,7 +311,7 @@ func crossProcessServe() error {
 		return fmt.Errorf("exit creating logger: %w", err)
 	}
 
-	uffd, err := NewUserfaultfdFromFd(uffdFd, data, m, l)
+	uffd, err := NewUserfaultfdFromFd(uffdFd, data, m, l, nil)
 	if err != nil {
 		return fmt.Errorf("exit creating uffd: %w", err)
 	}

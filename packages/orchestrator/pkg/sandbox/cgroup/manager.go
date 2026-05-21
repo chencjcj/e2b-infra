@@ -158,6 +158,20 @@ func (h *CgroupHandle) CgroupName() string {
 	return h.cgroupName
 }
 
+// SetHugetlbMax caps 2MB-hugepage consumption. Errors if controller is missing — non-fatal for callers.
+func (h *CgroupHandle) SetHugetlbMax(bytes uint64) error {
+	if h == nil || h.noop {
+		return nil
+	}
+
+	path := filepath.Join(h.path, "hugetlb.2MB.max")
+	value := strconv.FormatUint(bytes, 10)
+	if err := os.WriteFile(path, []byte(value), 0); err != nil {
+		return fmt.Errorf("write hugetlb.2MB.max=%s: %w", value, err)
+	}
+	return nil
+}
+
 // Manager handles initialization and creation of cgroups
 // Individual cgroup operations are performed through CgroupHandle
 type Manager interface {
@@ -188,14 +202,49 @@ func (m *managerImpl) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to create root cgroup directory: %w", err)
 	}
 
+	// In shared-memory mode +hugetlb on child cgroups breaks cross-cgroup
+	// charging of the parent-owned memfd mapping and aborts fc on resume.
+	hugetlbSupported, err := rootCgroupSupports("hugetlb")
+	if err != nil {
+		return fmt.Errorf("failed to read cgroup controllers: %w", err)
+	}
+	enableHugetlb := hugetlbSupported && !sharedMemoryEnabled()
+
+	desiredControllers := "+cpu +memory"
+	if enableHugetlb {
+		desiredControllers += " +hugetlb"
+	}
+
 	controllersPath := filepath.Join(RootCgroupPath, "cgroup.subtree_control")
-	if err := os.WriteFile(controllersPath, []byte("+cpu +memory"), 0o644); err != nil {
+	if err := os.WriteFile(controllersPath, []byte(desiredControllers), 0o644); err != nil {
 		return fmt.Errorf("failed to enable controllers: %w", err)
 	}
 
-	logger.L().Info(ctx, "initialized root cgroup", zap.String("path", RootCgroupPath))
+	logger.L().Info(ctx, "initialized root cgroup",
+		zap.String("path", RootCgroupPath),
+		zap.String("controllers", desiredControllers),
+		zap.Bool("hugetlb_enabled", hugetlbSupported),
+	)
 
 	return nil
+}
+
+func rootCgroupSupports(controller string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(cgroupV2MountPoint, "cgroup.controllers"))
+	if err != nil {
+		return false, err
+	}
+	for _, c := range strings.Fields(string(data)) {
+		if c == controller {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Mirrors cfg.Config.EnableSharedMemory; read from env to avoid pkg/cfg import cycle.
+func sharedMemoryEnabled() bool {
+	return strings.EqualFold(os.Getenv("ENABLE_SHARED_MEMORY"), "true")
 }
 
 func (m *managerImpl) Create(ctx context.Context, cgroupName string) (*CgroupHandle, error) {
@@ -312,10 +361,7 @@ func (m *managerImpl) readAndResetMemoryPeak(ctx context.Context, memoryPeakFile
 		return 0, fmt.Errorf("failed to parse memory.peak value %q: %w", strings.TrimSpace(string(buf[:n])), parseErr)
 	}
 
-	// Reset per-FD peak for next interval
-	if _, err := memoryPeakFile.WriteString("0"); err != nil {
-		logger.L().Warn(ctx, "failed to reset memory.peak, interval peak semantics degraded", zap.Error(err))
-	}
+	memoryPeakFile.WriteString("0")
 
 	return peakBytes, nil
 }

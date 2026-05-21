@@ -36,6 +36,23 @@ import (
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc")
 
+type fcTaggedWriter struct {
+	w   io.Writer
+	tag string
+}
+
+func (f *fcTaggedWriter) Write(p []byte) (n int, err error) {
+	for _, line := range bytes.SplitAfter(p, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		if _, werr := fmt.Fprintf(f.w, "%s %s", f.tag, line); werr != nil {
+			return 0, werr
+		}
+	}
+	return len(p), nil
+}
+
 // fcLogFilter wraps an io.Writer and suppresses Firecracker FlushMetrics
 // request/response log line pairs that fire every few seconds and create
 // excessive noise. The stateful flag is safe because Firecracker's API server
@@ -216,12 +233,18 @@ func (p *Process) configure(
 	if stdoutExternal != nil {
 		stdoutWriters = append(stdoutWriters, stdoutExternal)
 	}
+	if os.Getenv("FC_STDOUT_MIRROR") == "1" {
+		stdoutWriters = append(stdoutWriters, &fcTaggedWriter{w: os.Stdout, tag: "FC-STDOUT[" + sbxMetadata.LoggerMetadata().SandboxID + "]"})
+	}
 	p.cmd.Stdout = &fcLogFilter{w: io.MultiWriter(stdoutWriters...)}
 
 	stderrWriter := &zapio.Writer{Log: sbxlogger.I(sbxMetadata).Logger.Detach(ctx), Level: zap.ErrorLevel}
 	stderrWriters := []io.Writer{stderrWriter}
 	if stderrExternal != nil {
 		stderrWriters = append(stderrWriters, stderrExternal)
+	}
+	if os.Getenv("FC_STDERR_MIRROR") == "1" {
+		stderrWriters = append(stderrWriters, &fcTaggedWriter{w: os.Stderr, tag: "FC-STDERR[" + sbxMetadata.LoggerMetadata().SandboxID + "]"})
 	}
 	p.cmd.Stderr = io.MultiWriter(stderrWriters...)
 
@@ -460,6 +483,7 @@ func (p *Process) Resume(
 	cgroupFD int,
 	txRateLimit RateLimiterConfig,
 	driveRateLimit RateLimiterConfig,
+	sharedMemfdPath string,
 ) error {
 	ctx, span := tracer.Start(ctx, "resume-fc")
 	defer span.End()
@@ -546,6 +570,7 @@ func (p *Process) Resume(
 		uffdSocketPath,
 		uffdReady,
 		snapfile,
+		sharedMemfdPath,
 	)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
@@ -577,7 +602,7 @@ func (p *Process) Resume(
 	}
 
 	meta := &MmdsMetadata{
-		SandboxID:            sbxMetadata.SandboxID,
+		SandboxID:            sbxMetadata.LoggerMetadata().SandboxID,
 		TemplateID:           sbxMetadata.TemplateID,
 		LogsCollectorAddress: fmt.Sprintf("http://%s/logs", p.config.NetworkConfig.OrchestratorInSandboxIPAddress),
 	}

@@ -7,9 +7,8 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 )
 
-// Prefault proactively copies a page to guest memory at the given offset.
-// This is used to speed up sandbox starts by prefetching pages that are known to be needed.
-// Returns nil on success, or if the page is already mapped (EEXIST is handled gracefully).
+// Prefault populates the shared memfd (no PTE install) so the first read fires
+// as MINOR and resolves via CONTINUE. Falls back to UFFDIO_COPY when pagePool is nil.
 func (u *Userfaultfd) Prefault(ctx context.Context, offset int64, data []byte) error {
 	ctx, span := tracer.Start(ctx, "prefault page")
 	defer span.End()
@@ -23,10 +22,13 @@ func (u *Userfaultfd) Prefault(ctx context.Context, offset int64, data []byte) e
 		return fmt.Errorf("data length (%d) does not match pagesize (%d)", len(data), u.pageSize)
 	}
 
+	if u.pagePool != nil {
+		return u.pagePool.EnsurePagePopulatedDirect(offset, data)
+	}
+
 	return u.faultPage(ctx, addr, offset, directDataSource{data, int64(u.pageSize)}, nil, block.Prefetch)
 }
 
-// directDataSource wraps a byte slice to implement block.Slicer for prefaulting.
 type directDataSource struct {
 	data     []byte
 	pagesize int64
