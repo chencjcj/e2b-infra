@@ -434,8 +434,91 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	return &emptypb.Empty{}, nil
 }
 
+// KillRunningSandboxBlocking is the OOM-rescue stop path: SIGKILL + sync wait
+// for FC exit + UFFD shutdown, so caller's budget guard sees real wall-clock.
+// gRPC callers use StopRunningSandbox (graceful, async).
+func (s *Server) KillRunningSandboxBlocking(
+	ctx context.Context,
+	sbx *sandbox.Sandbox,
+	extraEventData map[string]any,
+) error {
+	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
+	if !marked {
+		return status.Errorf(codes.Internal, "failed to mark sandbox '%s' as stopping", sbx.Runtime.SandboxID)
+	}
+
+	sbxlogger.E(sbx).Info(ctx, "OOM rescue: pausing → snapshotting → killing")
+
+	sbx.Checks.Healthcheck(ctx, true)
+
+	// Snapshot before kill so the API gets a SandboxPausedEvent it can resume
+	// from. snapshotAndCacheSandbox internally pauses FC; SIGKILL afterwards
+	// releases hugepages fast.
+	oomBuildID := uuid.New().String()
+	snapStart := time.Now()
+	snapRes, snapErr := s.snapshotAndCacheSandbox(context.WithoutCancel(ctx), sbx, oomBuildID)
+	if snapErr != nil {
+		sbxlogger.E(sbx).Error(ctx, "OOM rescue snapshot FAILED",
+			zap.String("oom_snapshot_build_id", oomBuildID),
+			zap.Duration("duration", time.Since(snapStart)),
+			zap.Error(snapErr),
+		)
+	} else {
+		sbxlogger.E(sbx).Warn(ctx, "OOM rescue snapshot SAVED",
+			zap.String("oom_snapshot_build_id", oomBuildID),
+			zap.Duration("duration", time.Since(snapStart)),
+		)
+		s.uploadSnapshotAsync(context.WithoutCancel(ctx), sbx, snapRes)
+	}
+
+	// SIGKILL — release hugepages quickly. ctx still bounds the wait.
+	killErr := sbx.Kill(ctx)
+	if killErr != nil {
+		sbxlogger.I(sbx).Error(ctx, "error force-killing sandbox", logger.WithSandboxID(sbx.Runtime.SandboxID), zap.Error(killErr))
+	}
+
+	teamID, _, eventData := s.prepareSandboxEventData(ctx, sbx)
+	if s.featureFlags.BoolFlag(ctx, featureflags.ExecutionMetricsOnWebhooksFlag) {
+		eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	}
+	for k, v := range extraEventData {
+		eventData[k] = v
+	}
+
+	// Emit SandboxPaused if snapshot succeeded (so API DB binds the new
+	// build_id to this sandbox and `e2b sandbox resume` works), else fall
+	// back to SandboxKilled so the lifecycle still terminates properly.
+	eventType := events.SandboxKilledEventPair
+	emittedBuildID := sbx.Runtime.BuildID
+	if snapErr == nil {
+		eventType = events.SandboxPausedEventPair
+		emittedBuildID = oomBuildID
+		eventData["reason"] = "memory_pressure"
+		eventData["oom_snapshot_build_id"] = oomBuildID
+	}
+
+	go s.sbxEventsService.Publish(
+		context.WithoutCancel(ctx),
+		teamID,
+		events.SandboxEvent{
+			Version:            events.StructureVersionV2,
+			ID:                 uuid.New(),
+			Type:               eventType.Type,
+			Timestamp:          time.Now().UTC(),
+			EventData:          eventData,
+			SandboxID:          sbx.Runtime.SandboxID,
+			SandboxExecutionID: sbx.Runtime.ExecutionID,
+			SandboxTemplateID:  sbx.Config.BaseTemplateID,
+			SandboxBuildID:     emittedBuildID,
+			SandboxTeamID:      teamID,
+		},
+	)
+
+	return killErr
+}
+
 // StopRunningSandbox kills a sandbox without snapshotting. Used by the Delete
-// handler and the pressure monitor (eviction must not snapshot — would need pages).
+// handler. OOM rescue uses KillRunningSandboxBlocking (sync + SIGKILL).
 func (s *Server) StopRunningSandbox(
 	ctx context.Context,
 	sbx *sandbox.Sandbox,

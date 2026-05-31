@@ -25,6 +25,9 @@ type Metrics struct {
 	// HugepagesTotalBytes == 0 means no hugepage pool — treat as "no limit".
 	HugepagesTotalBytes uint64
 	HugepagesFreeBytes  uint64
+	// HugepageWatermark is the orchestrator-published admission threshold T.
+	// 0 means "not yet observed" — callers should treat that as 1.0.
+	HugepageWatermark float64
 
 	// Detailed disk metrics
 	HostDisks []DiskMetrics
@@ -51,6 +54,7 @@ func (n *Node) UpdateMetricsFromServiceInfoResponse(info *orchestratorinfo.Servi
 
 	n.metrics.HugepagesTotalBytes = info.GetMetricHugepagesTotalBytes()
 	n.metrics.HugepagesFreeBytes = info.GetMetricHugepagesFreeBytes()
+	n.metrics.HugepageWatermark = info.GetMetricHugepageWatermark()
 
 	// Update detailed disk metrics
 	disks := info.GetMetricDisks()
@@ -81,6 +85,7 @@ func (n *Node) Metrics() Metrics {
 
 		HugepagesTotalBytes: n.metrics.HugepagesTotalBytes,
 		HugepagesFreeBytes:  n.metrics.HugepagesFreeBytes,
+		HugepageWatermark:   n.metrics.HugepageWatermark,
 
 		HostDisks: make([]DiskMetrics, len(n.metrics.HostDisks)),
 	}

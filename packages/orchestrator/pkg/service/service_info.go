@@ -14,19 +14,26 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
+// WatermarkSource exposes the latest published hugepage admission watermark.
+type WatermarkSource interface {
+	Watermark() float64
+}
+
 type Server struct {
 	orchestratorinfo.UnimplementedInfoServiceServer
 
 	info        *ServiceInfo
 	sandboxes   *sandbox.Map
 	hostMetrics *metrics.HostMetrics
+	watermark   WatermarkSource
 }
 
-func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics) *Server {
+func NewInfoService(info *ServiceInfo, sandboxes *sandbox.Map, hostMetrics *metrics.HostMetrics, watermark WatermarkSource) *Server {
 	return &Server{
 		info:        info,
 		sandboxes:   sandboxes,
 		hostMetrics: hostMetrics,
+		watermark:   watermark,
 	}
 }
 
@@ -98,6 +105,7 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 
 		MetricHugepagesTotalBytes: hugepageMetrics.TotalBytes,
 		MetricHugepagesFreeBytes:  hugepageMetrics.FreeBytes,
+		MetricHugepageWatermark:   s.currentWatermark(),
 
 		// Detailed disk metrics
 		MetricDisks: convertDiskMetrics(diskMetrics),
@@ -107,6 +115,19 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		MetricMemoryUsedMb: int64(sandboxMemoryAllocated / (1024 * 1024)),
 		MetricDiskMb:       int64(sandboxDiskAllocated / (1024 * 1024)),
 	}, nil
+}
+
+// currentWatermark returns 1.0 (admission fully open) when no source is
+// wired or the source has not yet computed a value.
+func (s *Server) currentWatermark() float64 {
+	if s.watermark == nil {
+		return 1.0
+	}
+	t := s.watermark.Watermark()
+	if t <= 0 {
+		return 1.0
+	}
+	return t
 }
 
 // convertDiskMetrics converts internal DiskInfo to protobuf DiskMetrics

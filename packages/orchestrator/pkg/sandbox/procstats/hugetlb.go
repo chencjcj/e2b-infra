@@ -11,24 +11,41 @@ import (
 	"strings"
 )
 
-// ReadHugetlbBytes returns Private_Hugetlb + Shared_Hugetlb from /proc/<pid>/smaps_rollup.
-// (0, nil) when the file is missing (process exited / no hugetlb mappings).
-func ReadHugetlbBytes(pid int) (uint64, error) {
+// HugetlbStats splits hugetlb by Private (freeable by SIGKILL) and Shared
+// (memfd, survives the kill — other peers hold it).
+type HugetlbStats struct {
+	PrivateBytes uint64
+	SharedBytes  uint64
+}
+
+func (s HugetlbStats) Total() uint64 {
+	return s.PrivateBytes + s.SharedBytes
+}
+
+// ReadHugetlbStats parses /proc/<pid>/smaps_rollup. Missing file → zero, no err.
+func ReadHugetlbStats(pid int) (HugetlbStats, error) {
 	path := fmt.Sprintf("/proc/%d/smaps_rollup", pid)
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
+			return HugetlbStats{}, nil
 		}
-		return 0, fmt.Errorf("open %s: %w", path, err)
+		return HugetlbStats{}, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 
 	return parseHugetlbRollup(f)
 }
 
-func parseHugetlbRollup(r io.Reader) (uint64, error) {
-	var privateKB, sharedKB uint64
+// ReadHugetlbBytes returns Private + Shared (perceived total). For
+// freeable-by-kill accounting use ReadHugetlbStats.
+func ReadHugetlbBytes(pid int) (uint64, error) {
+	s, err := ReadHugetlbStats(pid)
+	return s.Total(), err
+}
+
+func parseHugetlbRollup(r io.Reader) (HugetlbStats, error) {
+	var stats HugetlbStats
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -36,22 +53,22 @@ func parseHugetlbRollup(r io.Reader) (uint64, error) {
 		case strings.HasPrefix(line, "Private_Hugetlb:"):
 			v, perr := parseKBLine(line)
 			if perr != nil {
-				return 0, fmt.Errorf("parse Private_Hugetlb: %w", perr)
+				return HugetlbStats{}, fmt.Errorf("parse Private_Hugetlb: %w", perr)
 			}
-			privateKB = v
+			stats.PrivateBytes = v * 1024
 		case strings.HasPrefix(line, "Shared_Hugetlb:"):
 			v, perr := parseKBLine(line)
 			if perr != nil {
-				return 0, fmt.Errorf("parse Shared_Hugetlb: %w", perr)
+				return HugetlbStats{}, fmt.Errorf("parse Shared_Hugetlb: %w", perr)
 			}
-			sharedKB = v
+			stats.SharedBytes = v * 1024
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("scan smaps_rollup: %w", err)
+		return HugetlbStats{}, fmt.Errorf("scan smaps_rollup: %w", err)
 	}
 
-	return (privateKB + sharedKB) * 1024, nil
+	return stats, nil
 }
 
 func parseKBLine(line string) (uint64, error) {

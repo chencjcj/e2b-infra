@@ -9,6 +9,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestReadHugetlbStats_NonExistentPid(t *testing.T) {
+	got, err := ReadHugetlbStats(math.MaxInt32)
+	require.NoError(t, err)
+	assert.Equal(t, HugetlbStats{}, got)
+}
+
 func TestReadHugetlbBytes_NonExistentPid(t *testing.T) {
 	got, err := ReadHugetlbBytes(math.MaxInt32)
 	require.NoError(t, err)
@@ -63,7 +69,11 @@ Locked:                0 kB
 `
 	got, err := parseHugetlbRollup(strings.NewReader(body))
 	require.NoError(t, err)
-	assert.Equal(t, uint64((2048+4096)*1024), got)
+	assert.Equal(t, HugetlbStats{
+		PrivateBytes: 4096 * 1024,
+		SharedBytes:  2048 * 1024,
+	}, got)
+	assert.Equal(t, uint64((2048+4096)*1024), got.Total())
 }
 
 func TestParseHugetlbRollup_NoHugetlbLines(t *testing.T) {
@@ -72,20 +82,27 @@ Pss: 4096 kB
 `
 	got, err := parseHugetlbRollup(strings.NewReader(body))
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0), got)
+	assert.Equal(t, HugetlbStats{}, got)
 }
 
 func TestParseHugetlbRollup_EmptyInput(t *testing.T) {
 	got, err := parseHugetlbRollup(strings.NewReader(""))
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0), got)
+	assert.Equal(t, HugetlbStats{}, got)
 }
 
 func TestParseHugetlbRollup_OnlyPrivate(t *testing.T) {
 	body := "Private_Hugetlb:   8192 kB\n"
 	got, err := parseHugetlbRollup(strings.NewReader(body))
 	require.NoError(t, err)
-	assert.Equal(t, uint64(8192*1024), got)
+	assert.Equal(t, HugetlbStats{PrivateBytes: 8192 * 1024}, got)
+}
+
+func TestParseHugetlbRollup_OnlyShared(t *testing.T) {
+	body := "Shared_Hugetlb:   1024 kB\n"
+	got, err := parseHugetlbRollup(strings.NewReader(body))
+	require.NoError(t, err)
+	assert.Equal(t, HugetlbStats{SharedBytes: 1024 * 1024}, got)
 }
 
 func TestParseHugetlbRollup_MalformedLine(t *testing.T) {

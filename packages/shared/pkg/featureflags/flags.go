@@ -147,7 +147,7 @@ func newIntFlag(name string, fallback int) IntFlag {
 }
 
 var (
-	MaxSandboxesPerNode           = newIntFlag("max-sandboxes-per-node", 200)
+	MaxSandboxesPerNode           = newIntFlag("max-sandboxes-per-node", 1200)
 	GcloudConcurrentUploadLimit   = newIntFlag("gcloud-concurrent-upload-limit", 8)
 	GcloudMaxTasks                = newIntFlag("gcloud-max-tasks", 16)
 	ClickhouseBatcherMaxBatchSize = newIntFlag("clickhouse-batcher-max-batch-size", 100)

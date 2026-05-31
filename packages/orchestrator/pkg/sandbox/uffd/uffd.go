@@ -34,28 +34,30 @@ const (
 )
 
 type Uffd struct {
-	exit       *utils.ErrorOnce
-	readyCh    chan struct{}
-	readyOnce  sync.Once
-	lis        *net.UnixListener
-	socketPath string
-	memfile    block.ReadonlyDevice
-	handler    utils.SetOnce[*userfaultfd.Userfaultfd]
-	fdExit     utils.SetOnce[*fdexit.FdExit]
-	pagePool   *pagepool.PagePool
+	exit          *utils.ErrorOnce
+	readyCh       chan struct{}
+	readyOnce     sync.Once
+	lis           *net.UnixListener
+	socketPath    string
+	memfile       block.ReadonlyDevice
+	handler       utils.SetOnce[*userfaultfd.Userfaultfd]
+	fdExit        utils.SetOnce[*fdexit.FdExit]
+	pagePool      *pagepool.PagePool
+	pressureWaker func()
 }
 
 var _ MemoryBackend = (*Uffd)(nil)
 
-func New(memfile block.ReadonlyDevice, socketPath string, pagePool *pagepool.PagePool) *Uffd {
+func New(memfile block.ReadonlyDevice, socketPath string, pagePool *pagepool.PagePool, pressureWaker func()) *Uffd {
 	return &Uffd{
-		exit:       utils.NewErrorOnce(),
-		readyCh:    make(chan struct{}),
-		socketPath: socketPath,
-		memfile:    memfile,
-		handler:    *utils.NewSetOnce[*userfaultfd.Userfaultfd](),
-		fdExit:     *utils.NewSetOnce[*fdexit.FdExit](),
-		pagePool:   pagePool,
+		exit:          utils.NewErrorOnce(),
+		readyCh:       make(chan struct{}),
+		socketPath:    socketPath,
+		memfile:       memfile,
+		handler:       *utils.NewSetOnce[*userfaultfd.Userfaultfd](),
+		fdExit:        *utils.NewSetOnce[*fdexit.FdExit](),
+		pagePool:      pagePool,
+		pressureWaker: pressureWaker,
 	}
 }
 
@@ -173,6 +175,7 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 		m,
 		logger.L().With(logger.WithSandboxID(sandboxId)),
 		u.pagePool,
+		u.pressureWaker,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create uffd: %w", err)

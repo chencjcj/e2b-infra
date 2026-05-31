@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +27,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/procstats"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
@@ -289,7 +292,16 @@ type Factory struct {
 	hostStatsDelivery hoststats.Delivery
 	cgroupManager     cgroup.Manager
 	egressProxy       network.EgressProxy
-	pagePools         sync.Map // map[string]*pagepool.PagePool — keyed by buildID
+
+	poolMu    sync.Mutex
+	pagePools map[string]*pagePoolEntry
+
+	pressureWaker atomic.Pointer[func()]
+}
+
+type pagePoolEntry struct {
+	pool  *pagepool.PagePool
+	count int // guarded by Factory.poolMu
 }
 
 func NewFactory(
@@ -311,25 +323,94 @@ func NewFactory(
 		hostStatsDelivery: hostStatsDelivery,
 		cgroupManager:     cgroupManager,
 		egressProxy:       egressProxy,
+		pagePools:         make(map[string]*pagePoolEntry),
 	}
 }
 
-func (f *Factory) getOrCreatePagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*pagepool.PagePool, error) {
-	if v, ok := f.pagePools.Load(buildID); ok {
-		return v.(*pagepool.PagePool), nil
+// SetPressureWaker installs the UFFD-ENOMEM → eviction.Wake callback.
+// Called once at startup after the pressure Monitor is constructed.
+func (f *Factory) SetPressureWaker(fn func()) {
+	if fn == nil {
+		f.pressureWaker.Store(nil)
+		return
 	}
+	f.pressureWaker.Store(&fn)
+}
+
+func (f *Factory) wakeFn() func() {
+	if p := f.pressureWaker.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// acquirePagePool +1 refcount on buildID's pool, creating it on first use.
+// Caller MUST releasePagePool when done. NewPagePool mmap is slow, so we drop
+// the lock across it; racing callers both create, the loser Closes its dup.
+func (f *Factory) acquirePagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*pagepool.PagePool, error) {
+	f.poolMu.Lock()
+	if entry, ok := f.pagePools[buildID]; ok {
+		entry.count++
+		pool := entry.pool
+		f.poolMu.Unlock()
+		return pool, nil
+	}
+	f.poolMu.Unlock()
 
 	pool, err := pagepool.NewPagePool(buildID, totalSize, pageSize, hugePages)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create page pool for %s: %w", buildID, err)
 	}
+	pool.SetPressureProbe(readPoolUsageFromMeminfo, pagepoolPressureFrac)
 
-	if existing, loaded := f.pagePools.LoadOrStore(buildID, pool); loaded {
-		pool.Close()
-		return existing.(*pagepool.PagePool), nil
+	f.poolMu.Lock()
+	if entry, ok := f.pagePools[buildID]; ok {
+		entry.count++
+		existing := entry.pool
+		f.poolMu.Unlock()
+		_ = pool.Close()
+		return existing, nil
 	}
+	f.pagePools[buildID] = &pagePoolEntry{pool: pool, count: 1}
+	f.poolMu.Unlock()
 
 	return pool, nil
+}
+
+// releasePagePool -1 refcount; on 0, removes from registry and Close()s.
+func (f *Factory) releasePagePool(buildID string) {
+	f.poolMu.Lock()
+	entry, ok := f.pagePools[buildID]
+	if !ok {
+		f.poolMu.Unlock()
+		return
+	}
+	entry.count--
+	if entry.count > 0 {
+		f.poolMu.Unlock()
+		return
+	}
+	delete(f.pagePools, buildID)
+	pool := entry.pool
+	f.poolMu.Unlock()
+
+	// Close outside the lock — Munmap of multi-GB hugetlb is slow.
+	_ = pool.Close()
+}
+
+// pagepoolPressureFrac: stop populating memfd above this watermark — copy()
+// into the MAP_NORESERVE mapping risks SIGBUS once the pool is exhausted.
+const pagepoolPressureFrac = 0.97
+
+func readPoolUsageFromMeminfo() (float64, error) {
+	total, free, err := procstats.ReadHugepagePool()
+	if err != nil {
+		return 0, err
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	return float64(total-free) / float64(total), nil
 }
 
 // PreBootFn is an optional callback invoked after the rootfs is ready but before
@@ -645,10 +726,25 @@ func (f *Factory) ResumeSandbox(
 				zap.Int64("block_size", memfile.BlockSize()),
 			)
 
-			pool, err = f.getOrCreatePagePool(runtime.BuildID, memfileSize, memfile.BlockSize(), config.HugePages)
+			pool, err = f.acquirePagePool(runtime.BuildID, memfileSize, memfile.BlockSize(), config.HugePages)
 			if err != nil {
+				// MAP_NORESERVE mmap can't fail on pool capacity, so ENOMEM
+				// here is from memfd_create / ftruncate — host hugepage
+				// quota hit. Sandbox should reschedule; runtime pool fill is
+				// handled later via ErrPoolPressureHigh fallback.
+				if errors.Is(err, syscall.ENOMEM) {
+					logger.L().Error(ctx, "page pool creation hit ENOMEM — sandbox should reschedule",
+						zap.String("build_id", runtime.BuildID),
+						zap.Int64("memfile_size", memfileSize),
+					)
+				}
 				return nil, fmt.Errorf("failed to get page pool: %w", err)
 			}
+			poolBuildID := runtime.BuildID
+			cleanup.AddNoContext(ctx, func() error {
+				f.releasePagePool(poolBuildID)
+				return nil
+			})
 
 			sharedMemfdPath = pool.MemfdPath()
 			logger.L().Info(ctx, "shared memory page pool ready",
@@ -661,7 +757,7 @@ func (f *Factory) ResumeSandbox(
 			)
 		}
 
-		return uffd.New(memfile, fcUffdPath, pool), nil
+		return uffd.New(memfile, fcUffdPath, pool, f.wakeFn()), nil
 	})
 
 	// Prefetching
@@ -1009,32 +1105,58 @@ func (s *Sandbox) Close(ctx context.Context) error {
 	return nil
 }
 
-// Stop kills the sandbox. It is safe to call multiple times; only the first
-// call will actually perform the stop operation.
+// Stop sends SIGTERM (graceful, 10s SIGKILL fallback). Safe to call multiple
+// times; first of Stop/Kill wins the once-init gate, others return its result.
 func (s *Sandbox) Stop(ctx context.Context) error {
 	return s.stop.GetOrInit(func() error {
-		return s.doStop(ctx)
+		return s.doStop(ctx, false)
 	})
 }
 
-// doStop performs the actual stop operation.
-func (s *Sandbox) doStop(ctx context.Context) error {
+// Kill is the OOM-rescue variant — direct SIGKILL, no SIGTERM grace period.
+// Required for the rescue path to fit the 5s UFFD stall budget.
+// Sends SIGKILL eagerly even if a graceful Stop already won the gate, so a
+// concurrent gRPC Delete in flight gets escalated instead of holding us for
+// up to 10s on its SIGTERM fallback.
+func (s *Sandbox) Kill(ctx context.Context) error {
+	if s.process != nil {
+		_ = s.process.Kill(ctx)
+	}
+	return s.stop.GetOrInit(func() error {
+		return s.doStop(ctx, true)
+	})
+}
+
+// doStop: force=true SIGKILL, force=false SIGTERM (with 10s SIGKILL fallback).
+func (s *Sandbox) doStop(ctx context.Context, force bool) error {
 	ctx, span := tracer.Start(ctx, "sandbox-close")
 	defer span.End()
 
 	var errs []error
 
-	// Stop the health checks before stopping the sandbox
 	s.Checks.Stop()
 
-	fcStopErr := s.process.Stop(ctx)
+	var fcStopErr error
+	if force {
+		fcStopErr = s.process.Kill(ctx)
+	} else {
+		fcStopErr = s.process.Stop(ctx)
+	}
 	if fcStopErr != nil {
 		errs = append(errs, fmt.Errorf("failed to stop FC: %w", fcStopErr))
 	}
 
-	// The process exited, we can continue with the rest of the cleanup.
-	// We could use select with ctx.Done() to wait for cancellation, but if the process is not exited the whole cleanup will be in a bad state and will result in unexpected behavior.
-	<-s.process.Exit.Done()
+	// Force path honors ctx deadline so the OOM rescue caller's stopFnTimeout
+	// actually bounds this wait — SIGKILL is in flight regardless.
+	if force {
+		select {
+		case <-s.process.Exit.Done():
+		case <-ctx.Done():
+			logger.L().Warn(ctx, "timed out waiting for FC exit after SIGKILL; kernel reclaim continues async")
+		}
+	} else {
+		<-s.process.Exit.Done()
+	}
 
 	uffdStopErr := s.Resources.memory.Stop()
 	if uffdStopErr != nil {

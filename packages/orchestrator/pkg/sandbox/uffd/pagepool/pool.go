@@ -2,17 +2,24 @@ package pagepool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 )
+
+// ErrPoolPressureHigh: caller should fall back to UFFDIO_COPY private path
+// because copy() into the MAP_NORESERVE mapping risks SIGBUS when pool is full.
+var ErrPoolPressureHigh = errors.New("hugepage pool pressure too high; populate deferred")
+
+// PoolUsageFn returns used/total ∈ [0, 1]. Must be cheap (sub-ms).
+type PoolUsageFn func() (float64, error)
 
 type pageEntry struct {
 	once sync.Once
@@ -31,8 +38,11 @@ type PagePool struct {
 	// populated is a bitset, one bit per page index, guarded by mu.
 	populated []uint64
 
-	warming  atomic.Bool
-	warmDone chan struct{}
+	closeOnce sync.Once
+
+	poolUsageFn  PoolUsageFn
+	pressureFrac float64
+	skippedCount atomic.Uint64
 }
 
 func NewPagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*PagePool, error) {
@@ -56,7 +66,9 @@ func NewPagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*Pa
 		return nil, fmt.Errorf("ftruncate memfd to %d: %w", totalSize, err)
 	}
 
-	// MAP_NORESERVE: allocate hugepages lazily on first write.
+	// MAP_NORESERVE: lazy alloc — pool only takes capacity for pages actually
+	// populated by sandbox READ-MISSING faults. SIGBUS risk on exhaustion is
+	// gated by SetPressureProbe.
 	mmapFlags := syscall.MAP_SHARED | syscall.MAP_NORESERVE
 	if hugePages {
 		mmapFlags |= unix.MAP_HUGETLB | unix.MAP_HUGE_2MB
@@ -78,8 +90,28 @@ func NewPagePool(buildID string, totalSize, pageSize int64, hugePages bool) (*Pa
 		pageSize:  pageSize,
 		mapping:   mapping,
 		populated: make([]uint64, bitmapLen),
-		warmDone:  make(chan struct{}),
 	}, nil
+}
+
+// SetPressureProbe gates populate() on pool watermark. frac=0 disables.
+func (p *PagePool) SetPressureProbe(usageFn PoolUsageFn, frac float64) {
+	p.poolUsageFn = usageFn
+	p.pressureFrac = frac
+}
+
+func (p *PagePool) SkippedPopulateCount() uint64 {
+	return p.skippedCount.Load()
+}
+
+func (p *PagePool) shouldDeferPopulate() bool {
+	if p.poolUsageFn == nil || p.pressureFrac <= 0 {
+		return false
+	}
+	usage, err := p.poolUsageFn()
+	if err != nil {
+		return false
+	}
+	return usage >= p.pressureFrac
 }
 
 func (p *PagePool) MemfdFd() int {
@@ -133,7 +165,8 @@ func (p *PagePool) validateOffset(offset int64) error {
 	return nil
 }
 
-// EnsurePagePopulated populates offset from source. Returns true if this call was the first writer.
+// EnsurePagePopulated populates offset from source. wasFirst=true on first writer.
+// Returns ErrPoolPressureHigh when probe blocks the write.
 func (p *PagePool) EnsurePagePopulated(ctx context.Context, offset int64, source block.Slicer) (bool, error) {
 	if p.IsPopulated(offset) {
 		return false, nil
@@ -141,6 +174,11 @@ func (p *PagePool) EnsurePagePopulated(ctx context.Context, offset int64, source
 
 	if err := p.validateOffset(offset); err != nil {
 		return false, err
+	}
+
+	if p.shouldDeferPopulate() {
+		p.skippedCount.Add(1)
+		return false, ErrPoolPressureHigh
 	}
 
 	entryI, _ := p.pages.LoadOrStore(offset, &pageEntry{})
@@ -167,6 +205,8 @@ func (p *PagePool) EnsurePagePopulated(ctx context.Context, offset int64, source
 	return wasFirst, entry.err
 }
 
+// EnsurePagePopulatedDirect populates offset from data.
+// Returns ErrPoolPressureHigh when probe blocks the write.
 func (p *PagePool) EnsurePagePopulatedDirect(offset int64, data []byte) error {
 	if p.IsPopulated(offset) {
 		return nil
@@ -180,6 +220,11 @@ func (p *PagePool) EnsurePagePopulatedDirect(offset int64, data []byte) error {
 		return fmt.Errorf("data length %d does not match pageSize %d at offset %d", len(data), p.pageSize, offset)
 	}
 
+	if p.shouldDeferPopulate() {
+		p.skippedCount.Add(1)
+		return ErrPoolPressureHigh
+	}
+
 	entryI, _ := p.pages.LoadOrStore(offset, &pageEntry{})
 	entry := entryI.(*pageEntry)
 
@@ -191,81 +236,26 @@ func (p *PagePool) EnsurePagePopulatedDirect(offset int64, data []byte) error {
 	return nil
 }
 
-// StartWarmup eagerly populates the memfd so faults resolve as MINOR → UFFDIO_CONTINUE. Idempotent.
-func (p *PagePool) StartWarmup(source block.Slicer) {
-	if !p.warming.CompareAndSwap(false, true) {
-		return
-	}
-
-	go func() {
-		defer close(p.warmDone)
-		ctx := context.Background()
-		numPages := p.size / p.pageSize
-
-		var wg errgroup.Group
-		wg.SetLimit(32)
-
-		var populatedCount atomic.Int64
-		var skippedCount atomic.Int64
-
-		for i := int64(0); i < numPages; i++ {
-			offset := i * p.pageSize
-
-			wg.Go(func() error {
-				if p.IsPopulated(offset) {
-					skippedCount.Add(1)
-					return nil
-				}
-
-				data, err := source.Slice(ctx, offset, p.pageSize)
-				if err != nil {
-					skippedCount.Add(1)
-					return nil
-				}
-
-				if err := p.EnsurePagePopulatedDirect(offset, data); err != nil {
-					skippedCount.Add(1)
-					return nil
-				}
-				populatedCount.Add(1)
-				return nil
-			})
+// Close releases the mapping. Idempotent.
+func (p *PagePool) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		var munmapErr, closeErr error
+		if p.mapping != nil {
+			munmapErr = syscall.Munmap(p.mapping)
+			p.mapping = nil
+		}
+		if p.memfdFd >= 0 {
+			closeErr = syscall.Close(p.memfdFd)
+			p.memfdFd = -1
 		}
 
-		wg.Wait()
-		fmt.Fprintf(os.Stderr, "pagepool warmup done: total=%d populated=%d skipped=%d\n", numPages, populatedCount.Load(), skippedCount.Load())
-	}()
-}
-
-func (p *PagePool) WaitWarmup(ctx context.Context) error {
-	select {
-	case <-p.warmDone:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (p *PagePool) Close() error {
-	var munmapErr, closeErr error
-
-	if p.mapping != nil {
-		munmapErr = syscall.Munmap(p.mapping)
-		p.mapping = nil
-	}
-
-	if p.memfdFd >= 0 {
-		closeErr = syscall.Close(p.memfdFd)
-		p.memfdFd = -1
-	}
-
-	if munmapErr != nil {
-		return fmt.Errorf("munmap: %w", munmapErr)
-	}
-
-	if closeErr != nil {
-		return fmt.Errorf("close memfd: %w", closeErr)
-	}
-
-	return nil
+		switch {
+		case munmapErr != nil:
+			err = fmt.Errorf("munmap: %w", munmapErr)
+		case closeErr != nil:
+			err = fmt.Errorf("close memfd: %w", closeErr)
+		}
+	})
+	return err
 }

@@ -43,13 +43,19 @@ const (
 var (
 	uffdMeter = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd")
 
+	// Outcome buckets — alerts on retry_exhausted, ignore ctx_cancelled noise.
 	uffdOutcomeKey     = attribute.Key("outcome")
 	attrRetrySucceeded = metric.WithAttributes(uffdOutcomeKey.String("retry_succeeded"))
 	attrRetryExhausted = metric.WithAttributes(uffdOutcomeKey.String("retry_exhausted"))
+	attrCtxCancelled   = metric.WithAttributes(uffdOutcomeKey.String("ctx_cancelled"))
+	attrOtherError     = metric.WithAttributes(uffdOutcomeKey.String("other_error"))
 
 	uffdCopyEnomemTotal = utils.Must(telemetry.GetCounter(uffdMeter, telemetry.SandboxUffdCopyEnomemTotal))
 	uffdStallDuration   = utils.Must(telemetry.GetHistogram(uffdMeter, telemetry.SandboxUffdStallDuration))
 	hugepageOomTotal    = utils.Must(telemetry.GetCounter(uffdMeter, telemetry.NodeHugepageOomTotal))
+
+	pagepoolPopulateSkippedTotal = utils.Must(telemetry.GetCounter(uffdMeter, telemetry.PagepoolPopulateSkippedTotal))
+	attrPopulateSkipPressure     = metric.WithAttributes(attribute.Key("reason").String("pressure"))
 )
 
 const maxRequestsInProgress = 4096
@@ -102,6 +108,9 @@ type Userfaultfd struct {
 
 	// Set on UFFDIO_COPY ENOMEM exhaustion; tags the exit lifecycle event.
 	lastFatalReason atomic.Pointer[string]
+
+	// Fires on first ENOMEM to wake eviction. nil = not wired (tests/builder).
+	pressureWaker func()
 
 	logger logger.Logger
 }
@@ -156,7 +165,7 @@ func (t *faultTracer) Close() error {
 	return t.f.Close()
 }
 
-func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logger logger.Logger, pagePool *pagepool.PagePool) (*Userfaultfd, error) {
+func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logger logger.Logger, pagePool *pagepool.PagePool, pressureWaker func()) (*Userfaultfd, error) {
 	blockSize := src.BlockSize()
 
 	for _, region := range m.Regions {
@@ -173,6 +182,7 @@ func NewUserfaultfdFromFd(fd uintptr, src block.Slicer, m *memory.Mapping, logge
 		prefetchTracker: block.NewPrefetchTracker(blockSize),
 		ma:              m,
 		pagePool:        pagePool,
+		pressureWaker:   pressureWaker,
 		logger:          logger,
 	}
 
@@ -516,40 +526,43 @@ retryLoop:
 		return fmt.Errorf("failed to read from source after %d attempts: %w", attempt+1, joinedErr)
 	}
 
-	// READ: populate memfd + WAKE → retry fires as MINOR → faultPageContinue
-	// installs a shared PTE. WRITE/Prefetch COW into private anon, so memfd
-	// population would just waste a hugepage.
+	// READ: populate memfd → retry fires as MINOR → CONTINUE installs shared
+	// PTE. WRITE/Prefetch COW into private anon anyway, skip memfd populate.
 	if u.pagePool != nil && accessType == block.Read {
-		if populateErr := u.pagePool.EnsurePagePopulatedDirect(offset, b); populateErr != nil {
+		populateErr := u.pagePool.EnsurePagePopulatedDirect(offset, b)
+		switch {
+		case errors.Is(populateErr, pagepool.ErrPoolPressureHigh):
+			// Pool too full for safe populate — fall through to private COPY.
+			span.SetAttributes(attribute.Bool("uffd.pool_pressure_skip", true))
+			pagepoolPopulateSkippedTotal.Add(ctx, 1, attrPopulateSkipPressure)
+		case populateErr != nil:
 			signalErr := safeInvoke(onFailure)
 			joinedErr := errors.Join(populateErr, signalErr)
 			span.RecordError(joinedErr)
 			u.logger.Error(ctx, "UFFD serve populate memfd error", zap.Error(joinedErr))
 			return fmt.Errorf("failed to populate memfd at offset %d: %w", offset, joinedErr)
-		}
-
-		wakeErr := u.fd.wake(addr, u.pageSize)
-		if errors.Is(wakeErr, unix.ESRCH) {
-			span.SetAttributes(attribute.Bool("uffd.process_exited", true))
-			u.logger.Debug(ctx, "UFFD serve wake: process no longer exists", zap.Error(wakeErr))
+		default:
+			wakeErr := u.fd.wake(addr, u.pageSize)
+			if errors.Is(wakeErr, unix.ESRCH) {
+				span.SetAttributes(attribute.Bool("uffd.process_exited", true))
+				u.logger.Debug(ctx, "UFFD serve wake: process no longer exists", zap.Error(wakeErr))
+				return nil
+			}
+			if wakeErr != nil {
+				signalErr := safeInvoke(onFailure)
+				joinedErr := errors.Join(wakeErr, signalErr)
+				span.RecordError(joinedErr)
+				u.logger.Error(ctx, "UFFD serve uffdio wake error", zap.Error(joinedErr))
+				return fmt.Errorf("failed uffdio wake: %w", joinedErr)
+			}
 			return nil
 		}
-		if wakeErr != nil {
-			signalErr := safeInvoke(onFailure)
-			joinedErr := errors.Join(wakeErr, signalErr)
-			span.RecordError(joinedErr)
-			u.logger.Error(ctx, "UFFD serve uffdio wake error", zap.Error(joinedErr))
-			return fmt.Errorf("failed uffdio wake: %w", joinedErr)
-		}
-
-		return nil
 	}
 
 	copyMode := u.defaultCopyMode
 
-	// Performing copy() on UFFD clears the WP bit unless we explicitly tell
-	// it not to. We do that for faults caused by a read access. Write accesses
-	// would anyways cause clear the write-protection bit.
+	// UFFDIO_COPY clears the WP bit by default; preserve it for read faults so
+	// the WP-protected PTE survives. Writes clear it anyway.
 	if accessType != block.Write {
 		copyMode |= UFFDIO_COPY_MODE_WP
 	}
@@ -602,6 +615,12 @@ retryLoop:
 
 // stallOnEnomem retries UFFDIO_COPY until pages free up or the budget elapses.
 func (u *Userfaultfd) stallOnEnomem(ctx context.Context, addr uintptr, b []byte, copyMode CULong) error {
+	// Wake eviction immediately — without this, ENOMEM waits up to tickIdle (1s)
+	// for the sampler to notice. Wake is non-blocking + idempotent.
+	if u.pressureWaker != nil {
+		u.pressureWaker()
+	}
+
 	stallStart := time.Now()
 	backoff := uffdEnomemBaseBackoff
 	timer := time.NewTimer(backoff)
@@ -621,8 +640,8 @@ func (u *Userfaultfd) stallOnEnomem(ctx context.Context, addr uintptr, b []byte,
 		timer.Reset(backoff)
 		select {
 		case <-ctx.Done():
-			uffdCopyEnomemTotal.Add(ctx, 1, attrRetryExhausted)
-			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetryExhausted)
+			uffdCopyEnomemTotal.Add(ctx, 1, attrCtxCancelled)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrCtxCancelled)
 			return copyErr
 		case <-timer.C:
 		}
@@ -636,8 +655,8 @@ func (u *Userfaultfd) stallOnEnomem(ctx context.Context, addr uintptr, b []byte,
 			return copyErr
 		}
 		if !errors.Is(copyErr, unix.ENOMEM) {
-			uffdCopyEnomemTotal.Add(ctx, 1, attrRetryExhausted)
-			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrRetryExhausted)
+			uffdCopyEnomemTotal.Add(ctx, 1, attrOtherError)
+			uffdStallDuration.Record(ctx, time.Since(stallStart).Milliseconds(), attrOtherError)
 			return copyErr
 		}
 
@@ -670,7 +689,11 @@ func (u *Userfaultfd) faultPageContinue(
 	}()
 
 	_, populateErr := u.pagePool.EnsurePagePopulated(ctx, offset, source)
-	if populateErr != nil {
+	if errors.Is(populateErr, pagepool.ErrPoolPressureHigh) {
+		// MINOR fault → memfd page already populated; CONTINUE succeeds anyway.
+		span.SetAttributes(attribute.Bool("uffd.pool_pressure_skip_minor", true))
+		pagepoolPopulateSkippedTotal.Add(ctx, 1, attrPopulateSkipPressure)
+	} else if populateErr != nil {
 		signalErr := safeInvoke(onFailure)
 		joinedErr := errors.Join(populateErr, signalErr)
 

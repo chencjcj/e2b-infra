@@ -55,6 +55,11 @@ const (
 	// PSI from /proc/pressure/memory.
 	NodeMemoryPressureSomeAvg10GaugeName GaugeFloatType = "e2b.node.memory.pressure.some.avg10"
 	NodeMemoryPressureFullAvg10GaugeName GaugeFloatType = "e2b.node.memory.pressure.full.avg10"
+
+	// Hugepage memory-pressure scheduling — dynamic watermark and rate estimator outputs.
+	NodeHugepagesWatermarkGaugeName     GaugeFloatType = "e2b.node.hugepages.watermark"
+	NodeHugepagesGrowthRateBytesGauge   GaugeFloatType = "e2b.node.hugepages.growth_rate_bytes"
+	NodeHugepagesTTESecondsGaugeName    GaugeFloatType = "e2b.node.hugepages.tte_seconds"
 )
 
 const (
@@ -103,9 +108,23 @@ const (
 	SandboxFCBlockFails         CounterType = "orchestrator.sandbox.fc.block.fails"
 	SandboxFCBlockNoAvailBuffer CounterType = "orchestrator.sandbox.fc.block.no_avail_buffer"
 
-	// outcome=retry_succeeded|retry_exhausted.
+	// outcome=retry_succeeded|retry_exhausted|ctx_cancelled|other_error.
+	// retry_exhausted is the alert signal (stall budget elapsed → sandbox dies).
 	SandboxUffdCopyEnomemTotal CounterType = "orchestrator.sandbox.uffd.copy_enomem.total"
 	NodeHugepageOomTotal       CounterType = "e2b.node.hugepage_oom.total"
+	// outcome=success|failure
+	NodePressureEvictTotal CounterType = "e2b.node.pressure.evict_total"
+	// outcome=drained|stagnant|max_kills|deficit_skip|topn_empty|meminfo_error|budget_exhausted
+	NodePressureEvictRoundTotal CounterType = "e2b.node.pressure.evict_round_total"
+	// Cooldown bypassed at panicFrac — early warning that pool is undersized.
+	NodePressureCooldownBypassTotal CounterType = "e2b.node.pressure.cooldown_bypass_total"
+
+	// PagepoolPopulateSkippedTotal: memfd populate skipped because the
+	// pressure probe (pool ≥ pagepoolPressureFrac) said it's not safe.
+	// reason: "pressure" on the SIGBUS-defense path. High counts mean
+	// sharing effectiveness is being throttled by host load — sandboxes
+	// fall back to private (UFFDIO_COPY) for these pages.
+	PagepoolPopulateSkippedTotal CounterType = "e2b.pagepool.populate_skipped_total"
 )
 
 const (
@@ -120,7 +139,11 @@ const (
 	SandboxFCNetRateLimiterEventCount HistogramType = "orchestrator.sandbox.fc.net.rate_limiter_event_count"
 	SandboxFCNetRemainingReqs         HistogramType = "orchestrator.sandbox.fc.net.remaining_reqs"
 
+	// outcome=retry_succeeded|retry_exhausted|ctx_cancelled|other_error
 	SandboxUffdStallDuration HistogramType = "orchestrator.sandbox.uffd.stall_duration"
+
+	// outcome=success|failure
+	NodePressureEvictDurationMs HistogramType = "e2b.node.pressure.evict_duration_ms"
 
 	// Firecracker block histograms — per-sandbox distribution per metrics flush, no sandbox_id.
 	// Symmetric read/write metrics carry a direction=read/write attribute.
@@ -185,6 +208,10 @@ var counterDesc = map[CounterType]string{
 
 	SandboxUffdCopyEnomemTotal: "UFFDIO_COPY calls that hit ENOMEM (hugepage pool exhausted), bucketed by outcome of the stall retry loop.",
 	NodeHugepageOomTotal:       "Sandboxes terminated because UFFDIO_COPY could not be served within the stall budget after exhausting retries.",
+	NodePressureEvictTotal:          "Sandboxes evicted by the memory-pressure controller to reclaim hugepages, bucketed by outcome.",
+	NodePressureEvictRoundTotal:     "Memory-pressure rescue rounds (one per evictBatch invocation), bucketed by terminal state (drained|stagnant|max_kills|deficit_skip|topn_empty|meminfo_error).",
+	NodePressureCooldownBypassTotal: "Times the post-batch cooldown was bypassed because usage climbed back to panicFrac during cooldown — pool is undersized vs incoming pressure.",
+	PagepoolPopulateSkippedTotal:    "Memfd populate calls skipped because the host hugepage pool was too close to full to safely write — falls back to private UFFDIO_COPY for that page.",
 }
 
 var counterUnits = map[CounterType]string{
@@ -208,8 +235,12 @@ var counterUnits = map[CounterType]string{
 	SandboxFCBlockFails:         "{error}",
 	SandboxFCBlockNoAvailBuffer: "{event}",
 
-	SandboxUffdCopyEnomemTotal: "{event}",
-	NodeHugepageOomTotal:       "{sandbox}",
+	SandboxUffdCopyEnomemTotal:  "{event}",
+	NodeHugepageOomTotal:        "{sandbox}",
+	NodePressureEvictTotal:          "{sandbox}",
+	NodePressureEvictRoundTotal:     "{round}",
+	NodePressureCooldownBypassTotal: "{event}",
+	PagepoolPopulateSkippedTotal:    "{page}",
 }
 
 var observableCounterDesc = map[ObservableCounterType]string{
@@ -256,12 +287,18 @@ var gaugeFloatDesc = map[GaugeFloatType]string{
 	SandboxCpuUsedGaugeName:              "Amount of CPU used by the sandbox.",
 	NodeMemoryPressureSomeAvg10GaugeName: "Node-wide PSI memory pressure (some) averaged over 10 seconds.",
 	NodeMemoryPressureFullAvg10GaugeName: "Node-wide PSI memory pressure (full) averaged over 10 seconds.",
+	NodeHugepagesWatermarkGaugeName:      "Current dynamic hugepage admission watermark T (used/total threshold below which the node accepts new sandboxes).",
+	NodeHugepagesGrowthRateBytesGauge:    "Predicted near-term hugepage growth rate r̂ = max(EWMA, P95, peak×0.7) in bytes per second.",
+	NodeHugepagesTTESecondsGaugeName:     "Predicted time-to-exhaustion of the hugepage pool at the current rate (free / r̂), in seconds.",
 }
 
 var gaugeFloatUnits = map[GaugeFloatType]string{
 	SandboxCpuUsedGaugeName:              "{percent}",
 	NodeMemoryPressureSomeAvg10GaugeName: "{percent}",
 	NodeMemoryPressureFullAvg10GaugeName: "{percent}",
+	NodeHugepagesWatermarkGaugeName:      "1",
+	NodeHugepagesGrowthRateBytesGauge:    "{By}/s",
+	NodeHugepagesTTESecondsGaugeName:     "s",
 }
 
 var gaugeIntDesc = map[GaugeIntType]string{
@@ -384,7 +421,8 @@ var histogramDesc = map[HistogramType]string{
 	SandboxFCNetRateLimiterEventCount: "Distribution of Firecracker VMM TX rate limiter events per metrics flush",
 	SandboxFCNetRemainingReqs:         "Distribution of Firecracker VMM TX queue remaining-request events per metrics flush",
 
-	SandboxUffdStallDuration: "Duration spent waiting for UFFDIO_COPY to succeed after hitting ENOMEM (with outcome=retry_succeeded|retry_exhausted attribute).",
+	SandboxUffdStallDuration:    "Duration spent waiting for UFFDIO_COPY to succeed after hitting ENOMEM (with outcome=retry_succeeded|retry_exhausted attribute).",
+	NodePressureEvictDurationMs: "Wall-clock duration from pressure-eviction trigger to SIGKILL completion (with outcome=success|failure attribute).",
 
 	// Firecracker block histograms (direction=read/write attribute)
 	SandboxFCBlockBytes:                 "Distribution of Firecracker VMM block bytes per metrics flush",
@@ -416,7 +454,8 @@ var histogramUnits = map[HistogramType]string{
 	SandboxFCNetRateLimiterEventCount: "{event}",
 	SandboxFCNetRemainingReqs:         "{event}",
 
-	SandboxUffdStallDuration: "ms",
+	SandboxUffdStallDuration:    "ms",
+	NodePressureEvictDurationMs: "ms",
 
 	// Firecracker block histograms
 	SandboxFCBlockBytes:                 "{By}",

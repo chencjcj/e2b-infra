@@ -573,17 +573,15 @@ func run(config cfg.Config, opts Options) (success bool) {
 		logger.L().Fatal(ctx, "failed to create orchestrator server", zap.Error(err))
 	}
 
-	pressureHardWatermarkPercent, _ := env.GetEnvAsInt("PRESSURE_HARD_WATERMARK_PERCENT", 90)
-	pressureTickIntervalMs, _ := env.GetEnvAsInt("PRESSURE_TICK_INTERVAL_MS", 5000)
-	pressureActionCooldownMs, _ := env.GetEnvAsInt("PRESSURE_ACTION_COOLDOWN_MS", 30000)
-	pressureMonitor := pressure.NewMonitor(sandboxes, hostMetrics, orchestratorService.StopRunningSandbox, pressure.Options{
-		HardWatermark:  float64(pressureHardWatermarkPercent) / 100.0,
-		TickInterval:   time.Duration(pressureTickIntervalMs) * time.Millisecond,
-		ActionCooldown: time.Duration(pressureActionCooldownMs) * time.Millisecond,
+	pressureMonitor := pressure.NewMonitor(sandboxes, hostMetrics, orchestratorService.KillRunningSandboxBlocking, pressure.Options{
+		Meter: tel.MeterProvider.Meter(serviceName),
 	})
 	if err := pressureMonitor.Validate(); err != nil {
 		logger.L().Fatal(ctx, "failed to validate pressure monitor", zap.Error(err))
 	}
+	// Wire UFFD-side ENOMEM → eviction.Wake() so a stalled fault handler
+	// preempts the sampler tick. Must be set before any sandbox is created.
+	sandboxFactory.SetPressureWaker(pressureMonitor.WakeEviction)
 	startService("pressure monitor", func() error {
 		return pressureMonitor.Start(ctx)
 	})
@@ -672,7 +670,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 		closers = append(closers, closer{"template server", tmpl.Close})
 	}
 
-	infoService := service.NewInfoService(serviceInfo, sandboxes, hostMetrics)
+	infoService := service.NewInfoService(serviceInfo, sandboxes, hostMetrics, pressureMonitor)
 	orchestratorinfo.RegisterInfoServiceServer(grpcServer, infoService)
 
 	grpcHealth := health.NewServer()

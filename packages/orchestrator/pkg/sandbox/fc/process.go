@@ -649,6 +649,8 @@ func getProcessStatus(pid int) ([]string, error) {
 	return proc.Status()
 }
 
+// Stop sends SIGTERM with 10s SIGKILL fallback. Use Kill for OOM rescue —
+// SIGTERM's grace period blows the 5s UFFD stall budget.
 func (p *Process) Stop(ctx context.Context) error {
 	if p.cmd.Process == nil {
 		return errors.New("fc process not started")
@@ -714,6 +716,29 @@ func (p *Process) Stop(ctx context.Context) error {
 		}
 	}()
 
+	return nil
+}
+
+// Kill sends SIGKILL directly (no SIGTERM grace). For OOM rescue. Caller waits
+// on p.Exit.Done() for synchronous behavior.
+func (p *Process) Kill(ctx context.Context) error {
+	if p.cmd.Process == nil {
+		return errors.New("fc process not started")
+	}
+
+	if removeErr := os.Remove(p.metricsPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		logger.L().Warn(ctx, "failed to remove fc metrics FIFO", zap.Error(removeErr), logger.WithSandboxID(p.files.SandboxID))
+	}
+
+	select {
+	case <-p.Exit.Done():
+		return nil
+	default:
+	}
+
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("failed to SIGKILL fc process: %w", err)
+	}
 	return nil
 }
 

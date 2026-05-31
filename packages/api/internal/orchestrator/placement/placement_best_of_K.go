@@ -84,19 +84,26 @@ func (b *BestOfK) CanFit(node *nodemanager.Node, sandboxResources nodemanager.Sa
 	return float64(reserved+uint32(sandboxResources.CPUs)) <= totalCapacity
 }
 
+// CanFitHugepages prefers the orchestrator-published dynamic watermark T,
+// falling back to the static config until one is observed. Nodes without a
+// hugepage pool always pass.
 func (b *BestOfK) CanFitHugepages(node *nodemanager.Node, config BestOfKConfig) bool {
-	if config.HugepagesSoftWatermark <= 0 {
-		return true
-	}
-
 	metrics := node.Metrics()
 	total := metrics.HugepagesTotalBytes
 	if total == 0 {
 		return true
 	}
 
+	threshold := metrics.HugepageWatermark
+	if threshold <= 0 || threshold > 1 {
+		if config.HugepagesSoftWatermark <= 0 {
+			return true
+		}
+		threshold = config.HugepagesSoftWatermark
+	}
+
 	used := total - metrics.HugepagesFreeBytes
-	return float64(used)/float64(total) < config.HugepagesSoftWatermark
+	return float64(used)/float64(total) < threshold
 }
 
 // BestOfK implements the fit-score-place algorithm

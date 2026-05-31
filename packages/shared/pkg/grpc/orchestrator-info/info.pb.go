@@ -309,8 +309,12 @@ type ServiceInfoResponse struct {
 	// Node hugepage pool — used for memory-pressure aware placement/eviction.
 	MetricHugepagesTotalBytes uint64 `protobuf:"varint,114,opt,name=metric_hugepages_total_bytes,json=metricHugepagesTotalBytes,proto3" json:"metric_hugepages_total_bytes,omitempty"`
 	MetricHugepagesFreeBytes  uint64 `protobuf:"varint,115,opt,name=metric_hugepages_free_bytes,json=metricHugepagesFreeBytes,proto3" json:"metric_hugepages_free_bytes,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Node-side dynamic admission watermark T (0..1). API placement rejects new
+	// sandboxes when used/total >= T. The watermark is recomputed by the
+	// pressure controller on each tick from rate prediction + declared RAM.
+	MetricHugepageWatermark float64 `protobuf:"fixed64,116,opt,name=metric_hugepage_watermark,json=metricHugepageWatermark,proto3" json:"metric_hugepage_watermark,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ServiceInfoResponse) Reset() {
@@ -507,6 +511,13 @@ func (x *ServiceInfoResponse) GetMetricHugepagesFreeBytes() uint64 {
 	return 0
 }
 
+func (x *ServiceInfoResponse) GetMetricHugepageWatermark() float64 {
+	if x != nil {
+		return x.MetricHugepageWatermark
+	}
+	return 0
+}
+
 type ServiceStatusChangeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ServiceStatus ServiceInfoStatus      `protobuf:"varint,2,opt,name=service_status,json=serviceStatus,proto3,enum=ServiceInfoStatus" json:"service_status,omitempty"`
@@ -572,7 +583,7 @@ const file_info_proto_rawDesc = "" +
 	"cpu_family\x18\x02 \x01(\tR\tcpuFamily\x12\x1b\n" +
 	"\tcpu_model\x18\x03 \x01(\tR\bcpuModel\x12$\n" +
 	"\x0ecpu_model_name\x18\x04 \x01(\tR\fcpuModelName\x12\x1b\n" +
-	"\tcpu_flags\x18\x05 \x03(\tR\bcpuFlags\"\x97\t\n" +
+	"\tcpu_flags\x18\x05 \x03(\tR\bcpuFlags\"\xd3\t\n" +
 	"\x13ServiceInfoResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -597,7 +608,8 @@ const file_info_proto_rawDesc = "" +
 	"\x1bmetric_disk_allocated_bytes\x18p \x01(\x04R\x18metricDiskAllocatedBytes\x12/\n" +
 	"\fmetric_disks\x18q \x03(\v2\f.DiskMetricsR\vmetricDisks\x12?\n" +
 	"\x1cmetric_hugepages_total_bytes\x18r \x01(\x04R\x19metricHugepagesTotalBytes\x12=\n" +
-	"\x1bmetric_hugepages_free_bytes\x18s \x01(\x04R\x18metricHugepagesFreeBytes\"W\n" +
+	"\x1bmetric_hugepages_free_bytes\x18s \x01(\x04R\x18metricHugepagesFreeBytes\x12:\n" +
+	"\x19metric_hugepage_watermark\x18t \x01(\x01R\x17metricHugepageWatermark\"W\n" +
 	"\x1aServiceStatusChangeRequest\x129\n" +
 	"\x0eservice_status\x18\x02 \x01(\x0e2\x12.ServiceInfoStatusR\rserviceStatus*J\n" +
 	"\x11ServiceInfoStatus\x12\v\n" +
