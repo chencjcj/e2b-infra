@@ -142,6 +142,76 @@ message SandboxListCachedBuildsResponse {
   repeated CachedBuildInfo builds = 1;
 }
 
+// MigrationPrepareSourceRequest tells the source orchestrator to pause its
+// running sandbox and become a passive RDMA endpoint serving the destination's
+// post-copy reads. The source replies with the qp_info + tcp endpoint the
+// destination must connect to, plus the full sandbox config + snapfile bytes
+// the destination needs to start a matching FC process.
+message MigrationPrepareSourceRequest {
+  string sandbox_id = 1;
+}
+
+message MigrationPrepareSourceResponse {
+  // RDMA endpoint of the source orchestrator's RDMA NIC.
+  string rdma_addr = 1;       // IPv4 address (RoCE-routed); empty = same as gRPC peer
+  uint32 tcp_port = 2;        // port chosen by rdma-source agent
+  string qp_info_hex = 3;     // packed qp_info struct, lowercase hex; opaque
+
+  // Sandbox shape needed to start FC on the destination identically.
+  SandboxConfig sandbox = 4;
+  bytes snapfile = 5;             // FC snapfile bytes (~KB)
+
+  // Memory layout the destination must reproduce. base_host_virt_addr is the
+  // VA where FC mmap'd the memfd on the source; the dest must arrange for FC
+  // to mmap at the SAME VA so fault VAs match offsets in the source MR. For
+  // multi-region sandboxes, repeated entries are returned in declared order.
+  repeated MigrationMemoryRegion memory_regions = 6;
+}
+
+message MigrationMemoryRegion {
+  uint64 base_host_virt_addr = 1;  // FC-side VA
+  uint64 size = 2;                 // bytes
+  uint64 offset = 3;               // offset within the memfd
+  uint64 page_size = 4;            // hugepage size
+}
+
+// MigrationCommitRequest tells the source orchestrator that the destination
+// has finished pulling all pages and is now serving the sandbox. The source
+// SIGKILLs its local FC and returns. After this RPC succeeds, the migration
+// is complete and the source's sandbox state is gone.
+message MigrationCommitRequest {
+  string sandbox_id = 1;
+}
+
+// MigrationAbortRequest tells the source orchestrator the destination
+// failed/cancelled. Source resumes its FC if possible and returns to running
+// state. Best-effort: if FC cannot resume, the sandbox is killed (callers
+// then fall back to GCS snapshot path).
+message MigrationAbortRequest {
+  string sandbox_id = 1;
+  string reason = 2;
+}
+
+// MigrationReceiveRequest is sent by the API to the destination orchestrator,
+// carrying everything from PrepareMigrationSource plus the source's RDMA
+// connection details. The destination spawns rdma-dest, starts FC against the
+// snapfile, and resumes the sandbox in post-copy mode.
+message MigrationReceiveRequest {
+  // Carry the full PrepareMigrationSource response verbatim.
+  MigrationPrepareSourceResponse source = 1;
+  google.protobuf.Timestamp start_time = 2;
+  google.protobuf.Timestamp end_time = 3;
+}
+
+message MigrationReceiveResponse {
+  // The orchestrator client_id of this destination, mirroring SandboxCreate.
+  string client_id = 1;
+  // Pages already pulled when the destination's FC went runnable. Diagnostic.
+  uint64 prefetch_pages_done = 2;
+  uint64 prefetch_pages_total = 3;
+  uint64 faults_handled = 4;
+}
+
 service SandboxService {
   rpc Create(SandboxCreateRequest) returns (SandboxCreateResponse);
   rpc Update(SandboxUpdateRequest) returns (google.protobuf.Empty);
@@ -151,4 +221,18 @@ service SandboxService {
   rpc Checkpoint(SandboxCheckpointRequest) returns (SandboxCheckpointResponse);
 
   rpc ListCachedBuilds(google.protobuf.Empty) returns (SandboxListCachedBuildsResponse);
+
+  // RDMA live migration. The API orchestrates these in sequence:
+  //   1. PrepareMigrationSource(src_orch) → snapfile + qp_info
+  //   2. (API forwards qp_info to dest, dest spawns rdma-dest agent,
+  //      starts FC, waits for prefetch done)
+  //   3. CommitMigration(src_orch)        → src SIGKILLs and returns
+  // On any failure, AbortMigration(src_orch) restores running state.
+  rpc PrepareMigrationSource(MigrationPrepareSourceRequest) returns (MigrationPrepareSourceResponse);
+  rpc CommitMigration(MigrationCommitRequest) returns (google.protobuf.Empty);
+  rpc AbortMigration(MigrationAbortRequest) returns (google.protobuf.Empty);
+
+  // Destination-side: API calls this to start receiving the sandbox.
+  // Blocks until the dest's FC is runnable + agent's prefetch is complete.
+  rpc ReceiveMigration(MigrationReceiveRequest) returns (MigrationReceiveResponse);
 }
