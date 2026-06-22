@@ -29,6 +29,21 @@ type Algorithm interface {
 	chooseNode(ctx context.Context, nodes []*nodemanager.Node, nodesExcluded map[string]struct{}, requested nodemanager.SandboxResources, buildMachineInfo machineinfo.MachineInfo, filterByLabels bool, requiredLabels []string) (*nodemanager.Node, error)
 }
 
+// PickNode runs the same scoring as PlaceSandbox without calling
+// SandboxCreate. Used by the migration path which dispatches the RPC itself.
+func PickNode(
+	ctx context.Context,
+	algorithm Algorithm,
+	clusterNodes []*nodemanager.Node,
+	excludedNodes map[string]struct{},
+	requested nodemanager.SandboxResources,
+	buildMachineInfo machineinfo.MachineInfo,
+	filterByLabels bool,
+	requiredLabels []string,
+) (*nodemanager.Node, error) {
+	return algorithm.chooseNode(ctx, clusterNodes, excludedNodes, requested, buildMachineInfo, filterByLabels, requiredLabels)
+}
+
 func PlaceSandbox(ctx context.Context, algorithm Algorithm, clusterNodes []*nodemanager.Node, preferredNode *nodemanager.Node, sbxRequest *orchestrator.SandboxCreateRequest, buildMachineInfo machineinfo.MachineInfo, labelFilteringEnabled bool, requiredLabels []string) (*nodemanager.Node, error) {
 	ctx, span := tracer.Start(ctx, "place-sandbox")
 	defer span.End()

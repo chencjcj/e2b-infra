@@ -736,6 +736,105 @@ components:
           type: integer
           description: Number of builds that failed to cancel
 
+    OOMSnapshotRegistration:
+      type: object
+      required:
+        - buildID
+        - sandboxID
+        - teamID
+        - originNodeID
+        - vcpu
+        - ramMB
+        - totalDiskSizeMB
+        - kernelVersion
+        - firecrackerVersion
+        - envdVersion
+      properties:
+        buildID:
+          type: string
+          format: uuid
+          description: build_id under which orchestrator wrote rescue files to GCS
+        sandboxID:
+          type: string
+        teamID:
+          type: string
+          format: uuid
+        originNodeID:
+          type: string
+          description: orchestrator NODE_ID where the snapshot was taken
+        vcpu:
+          type: integer
+          format: int64
+        ramMB:
+          type: integer
+          format: int64
+        totalDiskSizeMB:
+          type: integer
+          format: int64
+        kernelVersion:
+          type: string
+        firecrackerVersion:
+          type: string
+        envdVersion:
+          type: string
+        tag:
+          type: string
+          default: default
+
+    OOMSnapshotRegistrationResult:
+      type: object
+      required:
+        - snapshotID
+        - templateID
+        - buildID
+      properties:
+        snapshotID:
+          type: string
+          description: "<templateID>:<tag> — pass to SDK Sandbox.create()"
+        templateID:
+          type: string
+        buildID:
+          type: string
+          format: uuid
+
+    AdminMigrateSandboxRequest:
+      type: object
+      required:
+        - teamID
+        - sandboxID
+      properties:
+        teamID:
+          type: string
+          format: uuid
+          description: Team that owns the sandbox
+        sandboxID:
+          type: string
+          description: Sandbox to migrate
+        destNodeID:
+          type: string
+          description: Optional. If absent, the API picks any ready node other than the source.
+
+    AdminMigrateSandboxResult:
+      type: object
+      required:
+        - sourceNodeID
+        - destNodeID
+        - durationMs
+      properties:
+        sourceNodeID:
+          type: string
+        destNodeID:
+          type: string
+        durationMs:
+          type: integer
+          description: End-to-end migration time in milliseconds
+        prefetchPagesDone:
+          type: integer
+          format: int64
+        faultsHandled:
+          type: integer
+          format: int64
+
     VolumeToken:
       type: object
       properties:
@@ -3141,6 +3240,70 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminSandboxKillResult"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/snapshot-templates/from-oom:
+    post:
+      summary: Register an OOM-rescue snapshot as a snapshot_template
+      description: |
+        Called by orchestrator after the OOM rescue path successfully writes a
+        snapshot to GCS. Inserts the build into envs / snapshot_templates /
+        env_builds / env_build_assignments so the SDK can Sandbox.create()
+        from it. Idempotent: re-running with the same build_id will conflict
+        on env_builds_pkey and return 500.
+      tags: [admin]
+      security:
+        - AdminTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OOMSnapshotRegistration"
+      responses:
+        "200":
+          description: Successfully registered snapshot template
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OOMSnapshotRegistrationResult"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/sandboxes/migrate:
+    post:
+      summary: Live-migrate a sandbox between orchestrators via RDMA
+      description: |
+        Pauses the sandbox on its current node, post-copy migrates its memory
+        over RDMA to a destination node, and SIGKILLs the source. On any
+        failure, the source sandbox is resumed if possible.
+      tags: [admin]
+      security:
+        - AdminTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminMigrateSandboxRequest"
+      responses:
+        "200":
+          description: Migration succeeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMigrateSandboxResult"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":
