@@ -256,6 +256,50 @@ func (s *Sandbox) Pid() (int, error) {
 	return s.process.Pid()
 }
 
+// PauseFC pauses the FC vCPUs without going through the full snapshot
+// pipeline (no memfile diff, no template cache write). Used by RDMA live
+// migration where the memfd backing is shipped over the wire instead.
+func (s *Sandbox) PauseFC(ctx context.Context) error {
+	if s.process == nil {
+		return errors.New("fc process not initialized")
+	}
+	s.Checks.Stop()
+	return s.process.Pause(ctx)
+}
+
+// ResumeFC un-pauses FC vCPUs. Used to roll back a migration that was
+// prepared but didn't complete.
+func (s *Sandbox) ResumeFC(ctx context.Context) error {
+	if s.process == nil {
+		return errors.New("fc process not initialized")
+	}
+	if err := s.process.ResumePaused(ctx); err != nil {
+		return err
+	}
+	s.Checks.Start(ctx)
+	return nil
+}
+
+// CreateSnapshotFile writes FC's microvm state (registers, devices) to the
+// given path. Caller must have paused FC first. Does not touch memory.
+func (s *Sandbox) CreateSnapshotFile(ctx context.Context, path string) error {
+	if s.process == nil {
+		return errors.New("fc process not initialized")
+	}
+	return s.process.CreateSnapshot(ctx, path)
+}
+
+// CreateSnapshotWithMem writes both FC's microvm state (snapPath) and the
+// full guest memory contents (memPath). Caller must have paused FC first.
+// Used by migration source where the page-pool memfd's pagecache does not
+// reflect FC's live state due to MAP_PRIVATE CoW.
+func (s *Sandbox) CreateSnapshotWithMem(ctx context.Context, snapPath, memPath string) error {
+	if s.process == nil {
+		return errors.New("fc process not initialized")
+	}
+	return s.process.CreateSnapshotWithMem(ctx, snapPath, memPath)
+}
+
 func (s *Sandbox) MemoryCurrent() (uint64, error) {
 	return s.cgroupHandle.MemoryCurrent()
 }
@@ -375,6 +419,19 @@ func (f *Factory) acquirePagePool(buildID string, totalSize, pageSize int64, hug
 	f.poolMu.Unlock()
 
 	return pool, nil
+}
+
+// GetPagePool returns the page pool currently servicing a buildID, or nil
+// if none is registered. The caller must NOT release; this is a read-only
+// accessor for migration agents that need the underlying memfd FD.
+func (f *Factory) GetPagePool(buildID string) *pagepool.PagePool {
+	f.poolMu.Lock()
+	defer f.poolMu.Unlock()
+	entry, ok := f.pagePools[buildID]
+	if !ok {
+		return nil
+	}
+	return entry.pool
 }
 
 // releasePagePool -1 refcount; on 0, removes from registry and Close()s.

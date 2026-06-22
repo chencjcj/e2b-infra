@@ -130,12 +130,25 @@ func (c *apiClient) createSnapshot(
 	ctx context.Context,
 	snapfilePath string,
 ) error {
+	return c.createSnapshotFull(ctx, snapfilePath, "")
+}
+
+
+func (c *apiClient) createSnapshotFull(
+	ctx context.Context,
+	snapfilePath string,
+	memfilePath string,
+) error {
+	body := &models.SnapshotCreateParams{
+		SnapshotType: models.SnapshotCreateParamsSnapshotTypeFull,
+		SnapshotPath: &snapfilePath,
+	}
+	if memfilePath != "" {
+		body.MemFilePath = memfilePath
+	}
 	snapshotConfig := operations.CreateSnapshotParams{
 		Context: ctx,
-		Body: &models.SnapshotCreateParams{
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeFull,
-			SnapshotPath: &snapfilePath,
-		},
+		Body:    body,
 	}
 
 	_, err := c.client.Operations.CreateSnapshot(&snapshotConfig)

@@ -102,6 +102,32 @@ type Config struct {
 	NBDPoolSize                int               `env:"NBD_POOL_SIZE"                 envDefault:"64"`
 	Services                   []string          `env:"ORCHESTRATOR_SERVICES"         envDefault:"orchestrator"`
 	PersistentVolumeMounts     map[string]string `env:"PERSISTENT_VOLUME_MOUNTS"`
+
+	// RDMA migration config; empty source/dest binary paths disable migration.
+	RDMASourceBinary  string `env:"RDMA_SOURCE_BIN"`
+	RDMADestBinary    string `env:"RDMA_DEST_BIN"`
+	// RDMADevice optionally pins the ibverbs device name (e.g. mlx5_10).
+	// If empty, the orchestrator auto-discovers it by scanning
+	// /sys/class/infiniband/ and matching against RDMASubnet.
+	RDMADevice        string `env:"RDMA_DEVICE"`
+	// RDMASubnet is the RoCE network in CIDR form (e.g. 10.253.240.0/24).
+	// Used to auto-discover the right RDMA device when devices are named
+	// differently across nodes (mlx5_10 here, mlx5_2 there, mlx5_bond_0
+	// somewhere else). Highly recommended for fleet deployments — set this
+	// once, and every node finds its own RDMA NIC + IP.
+	RDMASubnet        string `env:"RDMA_SUBNET"`
+	RDMAGIDIndex      uint8  `env:"RDMA_GID_INDEX" envDefault:"3"`
+	RDMAHCAPort       uint8  `env:"RDMA_HCA_PORT"  envDefault:"1"`
+	// RDMAAdvertiseAddr is the IPv4 address this node advertises in
+	// PrepareMigrationSource responses for the destination's TCP connect.
+	// Auto-resolved from RDMADevice/RDMASubnet at startup if unset.
+	RDMAAdvertiseAddr string `env:"RDMA_ADVERTISE_ADDR"`
+
+	// API hooks — used by the OOM rescue path to ask the API to live-migrate
+	// the victim sandbox before falling back to the GCS snapshot path. Both
+	// must be set to enable; otherwise the OOM path goes straight to GCS.
+	APIBaseURL    string `env:"API_BASE_URL"`
+	APIAdminToken string `env:"API_ADMIN_TOKEN"`
 }
 
 func (c Config) NodeAddress() *string {

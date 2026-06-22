@@ -749,10 +749,31 @@ func (p *Process) Pause(ctx context.Context) error {
 	return p.client.pauseVM(ctx)
 }
 
+// ResumePaused resumes a previously-paused FC. This is just PatchVM=Resumed
+// — does NOT reload from a snapfile (the heavyweight Process.Resume does).
+// Used by RDMA migration's abort path to restore a paused FC to running.
+func (p *Process) ResumePaused(ctx context.Context) error {
+	ctx, childSpan := tracer.Start(ctx, "resume-fc-paused")
+	defer childSpan.End()
+
+	return p.client.resumeVM(ctx)
+}
+
 // CreateSnapshot VM needs to be paused before creating a snapshot.
 func (p *Process) CreateSnapshot(ctx context.Context, snapfilePath string) error {
 	ctx, childSpan := tracer.Start(ctx, "create-snapshot-fc")
 	defer childSpan.End()
 
 	return p.client.createSnapshot(ctx, snapfilePath)
+}
+
+// CreateSnapshotWithMem dumps both microVM state and the full guest memory
+// contents. Required for migration source: with shared_memfd_path FC mmaps
+// the memfd MAP_PRIVATE, so live writes never reach the memfd's pagecache —
+// only this call captures FC's full memory view.
+func (p *Process) CreateSnapshotWithMem(ctx context.Context, snapfilePath, memfilePath string) error {
+	ctx, childSpan := tracer.Start(ctx, "create-snapshot-fc-with-mem")
+	defer childSpan.End()
+
+	return p.client.createSnapshotFull(ctx, snapfilePath, memfilePath)
 }

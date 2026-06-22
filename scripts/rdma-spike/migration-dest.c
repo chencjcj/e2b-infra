@@ -18,7 +18,6 @@
 //   ./rdma-server -size 4G -port 12345 -dev mlx5_10 -gid-idx 3
 //   ./migration-dest -addr <src-ip> -port 12345 -size 4G -dev mlx5_10 -gid-idx 3
 
-#define _GNU_SOURCE
 #include <pthread.h>
 #include <poll.h>
 #include <signal.h>

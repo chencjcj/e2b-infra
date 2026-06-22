@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	awsOperationTimeout = 5 * time.Second
-	awsWriteTimeout     = 30 * time.Second
-	awsReadTimeout      = 15 * time.Second
+	awsOperationTimeout = 5 * time.Minute
+	awsWriteTimeout     = 30 * time.Minute
+	awsReadTimeout      = 15 * time.Minute
 )
 
 type awsStorage struct {

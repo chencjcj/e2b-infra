@@ -43,7 +43,10 @@ const (
 	requestTimeout = 60 * time.Second
 	// acquireTimeout is the max time to wait for a semaphore for resuming sandboxes snapshot.
 	acquireTimeout              = 15 * time.Second
-	maxStartingInstancesPerNode = 3
+	maxStartingInstancesPerNode = 32
+
+	maxPausingInstancesPerNode = 16
+	pauseAcquireTimeout        = 2 * time.Minute
 
 	// uploadTimeout is the max time allowed for uploading snapshot files to GCS.
 	uploadTimeout = 20 * time.Minute
@@ -434,14 +437,20 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 	return &emptypb.Empty{}, nil
 }
 
-// KillRunningSandboxBlocking is the OOM-rescue stop path: SIGKILL + sync wait
-// for FC exit + UFFD shutdown, so caller's budget guard sees real wall-clock.
-// gRPC callers use StopRunningSandbox (graceful, async).
+// KillRunningSandboxBlocking is the OOM-rescue stop path: tries RDMA
+// live-migration first, then falls back to GCS snapshot + SIGKILL. Sync wait
+// for FC exit so the caller's budget guard sees real wall-clock. gRPC callers
+// use StopRunningSandbox (graceful, async).
 func (s *Server) KillRunningSandboxBlocking(
 	ctx context.Context,
 	sbx *sandbox.Sandbox,
 	extraEventData map[string]any,
 ) error {
+	if s.tryRDMAMigrationOnPressure(ctx, sbx) {
+		sbxlogger.E(sbx).Info(ctx, "OOM rescue: sandbox migrated via RDMA — local FC already SIGKILL'd by Commit")
+		return nil
+	}
+
 	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
 	if !marked {
 		return status.Errorf(codes.Internal, "failed to mark sandbox '%s' as stopping", sbx.Runtime.SandboxID)
@@ -451,9 +460,8 @@ func (s *Server) KillRunningSandboxBlocking(
 
 	sbx.Checks.Healthcheck(ctx, true)
 
-	// Snapshot before kill so the API gets a SandboxPausedEvent it can resume
-	// from. snapshotAndCacheSandbox internally pauses FC; SIGKILL afterwards
-	// releases hugepages fast.
+	// snapshotAndCacheSandbox internally pauses FC; SIGKILL afterwards releases
+	// hugepages fast. The build_id propagates into the SandboxPausedEvent.
 	oomBuildID := uuid.New().String()
 	snapStart := time.Now()
 	snapRes, snapErr := s.snapshotAndCacheSandbox(context.WithoutCancel(ctx), sbx, oomBuildID)
@@ -471,7 +479,6 @@ func (s *Server) KillRunningSandboxBlocking(
 		s.uploadSnapshotAsync(context.WithoutCancel(ctx), sbx, snapRes)
 	}
 
-	// SIGKILL — release hugepages quickly. ctx still bounds the wait.
 	killErr := sbx.Kill(ctx)
 	if killErr != nil {
 		sbxlogger.I(sbx).Error(ctx, "error force-killing sandbox", logger.WithSandboxID(sbx.Runtime.SandboxID), zap.Error(killErr))
@@ -485,9 +492,6 @@ func (s *Server) KillRunningSandboxBlocking(
 		eventData[k] = v
 	}
 
-	// Emit SandboxPaused if snapshot succeeded (so API DB binds the new
-	// build_id to this sandbox and `e2b sandbox resume` works), else fall
-	// back to SandboxKilled so the lifecycle still terminates properly.
 	eventType := events.SandboxKilledEventPair
 	emittedBuildID := sbx.Runtime.BuildID
 	if snapErr == nil {
@@ -495,6 +499,17 @@ func (s *Server) KillRunningSandboxBlocking(
 		emittedBuildID = oomBuildID
 		eventData["reason"] = "memory_pressure"
 		eventData["oom_snapshot_build_id"] = oomBuildID
+
+		// Best-effort DB registration so SDK Sandbox.create("<id>") resolves;
+		// failure leaves the build_id in the event for manual recovery.
+		if snapID, regErr := s.registerOOMSnapshotInAPI(ctx, sbx, oomBuildID); regErr != nil {
+			sbxlogger.E(sbx).Warn(ctx, "OOM snapshot DB registration failed; SDK Sandbox.create will not find this build",
+				zap.String("oom_snapshot_build_id", oomBuildID), zap.Error(regErr))
+		} else if snapID != "" {
+			eventData["oom_snapshot_id"] = snapID
+			sbxlogger.E(sbx).Info(ctx, "OOM snapshot registered in DB",
+				zap.String("snapshot_id", snapID))
+		}
 	}
 
 	go s.sbxEventsService.Publish(
@@ -612,6 +627,11 @@ func (s *Server) PauseRunningSandbox(
 	}
 
 	sbxlogger.E(sbx).Info(ctx, "Pausing sandbox")
+
+	if err := s.waitForPauseAcquire(ctx); err != nil {
+		return err
+	}
+	defer s.pausingSandboxes.Release(1)
 
 	// Stop the old sandbox in background after we're done
 	defer s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)

@@ -147,14 +147,14 @@ func newIntFlag(name string, fallback int) IntFlag {
 }
 
 var (
-	MaxSandboxesPerNode           = newIntFlag("max-sandboxes-per-node", 1200)
+	MaxSandboxesPerNode           = newIntFlag("max-sandboxes-per-node", 1000)
 	GcloudConcurrentUploadLimit   = newIntFlag("gcloud-concurrent-upload-limit", 8)
 	GcloudMaxTasks                = newIntFlag("gcloud-max-tasks", 16)
 	ClickhouseBatcherMaxBatchSize = newIntFlag("clickhouse-batcher-max-batch-size", 100)
 	ClickhouseBatcherMaxDelay     = newIntFlag("clickhouse-batcher-max-delay", 1000) // 1s in milliseconds
 	ClickhouseBatcherQueueSize    = newIntFlag("clickhouse-batcher-queue-size", 1000)
 	BestOfKSampleSize             = newIntFlag("best-of-k-sample-size", 3)                   // Default K=3
-	BestOfKMaxOvercommit          = newIntFlag("best-of-k-max-overcommit", 400)              // Default R=4 (stored as percentage, max over-commit ratio)
+	BestOfKMaxOvercommit          = newIntFlag("best-of-k-max-overcommit", 400)             // Default R=4 (stored as percentage, max over-commit ratio)
 	BestOfKAlpha                  = newIntFlag("best-of-k-alpha", 50)                        // Default Alpha=0.5 (stored as percentage for int flag, current usage weight)
 	EnvdInitTimeoutMilliseconds   = newIntFlag("envd-init-request-timeout-milliseconds", 50) // Timeout for envd init request in milliseconds
 	HostStatsSamplingInterval     = newIntFlag("host-stats-sampling-interval", 5000)         // Host stats sampling interval in milliseconds (default 5s)
@@ -194,6 +194,9 @@ var (
 	// BuildReservedDiskSpaceMB is the amount of disk space in MB reserved for root on the guest filesystem.
 	// Reserved blocks are only usable by root (uid 0), protecting the guest OS from disk-full conditions.
 	BuildReservedDiskSpaceMB = newIntFlag("build-reserved-disk-space-mb", 0)
+
+	// OrchestratorMaxConcurrentPauses bounds concurrent sandbox snapshots (pause) per node. Must be > 0.
+	OrchestratorMaxConcurrentPauses = newIntFlag("orchestrator-max-concurrent-pauses", 16)
 
 	// MaxConcurrentSnapshotUpserts limits concurrent UpsertSnapshot calls (pause + snapshot template paths).
 	// 0 or negative disables throttling (unlimited concurrency).

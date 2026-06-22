@@ -35,6 +35,9 @@ func (noopMetricExporter) Shutdown(context.Context) error {
 }
 
 func NewMeterExporter(ctx context.Context, extraOption ...otlpmetricgrpc.Option) (sdkmetric.Exporter, error) {
+	if otelCollectorGRPCEndpoint == "" {
+		return noopMetricExporter{}, nil
+	}
 	opts := []otlpmetricgrpc.Option{
 		otlpmetricgrpc.WithInsecure(),
 		otlpmetricgrpc.WithEndpoint(otelCollectorGRPCEndpoint),
